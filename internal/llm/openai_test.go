@@ -37,7 +37,7 @@ func TestOpenAIClientBuildsRequestAndParsesResponse(t *testing.T) {
 			t.Fatalf("decode request: %v", err)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"action\":\"final\",\"answer\":\"ok\"}"}}]}`))
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"action\":\"final\",\"content\":{\"answer\":\"ok\"}}"}}]}`))
 	}))
 	defer server.Close()
 
@@ -63,7 +63,7 @@ func TestOpenAIClientBuildsRequestAndParsesResponse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("chat: %v", err)
 	}
-	if response.Content != `{"action":"final","answer":"ok"}` {
+	if response.Content != `{"action":"final","content":{"answer":"ok"}}` {
 		t.Fatalf("content = %q", response.Content)
 	}
 	if got.Model != "test-model" {
@@ -119,7 +119,7 @@ func TestOpenAIClientRetriesTransientFailures(t *testing.T) {
 		case 2:
 			http.Error(w, `{"error":{"message":"unavailable"}}`, http.StatusServiceUnavailable)
 		default:
-			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"action\":\"final\",\"answer\":\"ok\"}"}}]}`))
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"action\":\"final\",\"content\":{\"answer\":\"ok\"}}"}}]}`))
 		}
 	}))
 	defer server.Close()

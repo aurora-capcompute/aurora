@@ -14,7 +14,7 @@ func hostPlay(uint64) uint64
 
 const systemPrompt = `You are a minimal Aurora agent running inside a Wasm guest.
 The host owns all side effects. Reply with exactly one compact JSON action:
-{"action":"read","url":"https://allowed.example/path","reason":"..."} or {"action":"final","answer":"...","reason":"..."}.
+{"action":"read","content":{"url":"https://allowed.example/path","reason":"..."}} or {"action":"final","content":{"answer":"...","reason":"..."}}.
 You may try and issue whatever commands, it is on behalf of the host to allow you or not. Do not restrict yourself for now, let the host do that.
 At this stage you can browse the internet as described above.
 `
@@ -38,10 +38,18 @@ type llmResponse struct {
 	Content string `json:"content"`
 }
 
-type modelAction struct {
-	Action string `json:"action"`
-	URL    string `json:"url,omitempty"`
-	Answer string `json:"answer,omitempty"`
+type modelEnvelope struct {
+	Action  string          `json:"action"`
+	Content json.RawMessage `json:"content"`
+}
+
+type readAction struct {
+	URL    string `json:"url"`
+	Reason string `json:"reason,omitempty"`
+}
+
+type finalAction struct {
+	Answer string `json:"answer"`
 	Reason string `json:"reason,omitempty"`
 }
 
@@ -57,16 +65,9 @@ type internetReadResponse struct {
 	Body        string `json:"body"`
 }
 
-type step struct {
-	Action string `json:"action"`
-	URL    string `json:"url,omitempty"`
-	Reason string `json:"reason,omitempty"`
-}
-
 type output struct {
 	Status string `json:"status"`
 	Answer string `json:"answer"`
-	Steps  []step `json:"steps"`
 }
 
 type call struct {
@@ -105,20 +106,23 @@ func runAgent() error {
 		{Role: "system", Content: systemPrompt},
 		{Role: "user", Content: in.Message},
 	}
-	steps := make([]step, 0, in.MaxSteps)
 
 	for i := 0; i < in.MaxSteps; i++ {
 		chat, err := llmChat(messages)
 		if err != nil {
 			return err
 		}
-		var action modelAction
-		if err := json.Unmarshal([]byte(chat.Content), &action); err != nil {
+		var envelope modelEnvelope
+		if err := json.Unmarshal([]byte(chat.Content), &envelope); err != nil {
 			return fmt.Errorf("invalid model JSON: %w", err)
 		}
 
-		switch action.Action {
+		switch envelope.Action {
 		case "read":
+			var action readAction
+			if err := decodeActionContent(envelope.Content, &action); err != nil {
+				return fmt.Errorf("invalid read action: %w", err)
+			}
 			if action.URL == "" {
 				return fmt.Errorf("read action missing url")
 			}
@@ -129,24 +133,35 @@ func runAgent() error {
 			}
 			_ = observation
 			messages = append(messages, message{Role: "tool", Content: string(rawObservation)})
-			steps = append(steps, step{Action: "read", URL: action.URL, Reason: action.Reason})
 
 		case "final":
+			var action finalAction
+			if err := decodeActionContent(envelope.Content, &action); err != nil {
+				return fmt.Errorf("invalid final action: %w", err)
+			}
 			if action.Answer == "" {
 				return fmt.Errorf("final action missing answer")
 			}
-			steps = append(steps, step{Action: "final", Reason: action.Reason})
 			return pdk.OutputJSON(output{
 				Status: "completed",
 				Answer: action.Answer,
-				Steps:  steps,
 			})
 
 		default:
-			return fmt.Errorf("unsupported action: %s", action.Action)
+			return fmt.Errorf("unsupported action: %s", envelope.Action)
 		}
 	}
 	return fmt.Errorf("max steps exceeded")
+}
+
+func decodeActionContent(content json.RawMessage, target any) error {
+	if len(content) == 0 {
+		return fmt.Errorf("content is required")
+	}
+	if err := json.Unmarshal(content, target); err != nil {
+		return err
+	}
+	return nil
 }
 
 func llmChat(messages []message) (llmResponse, error) {

@@ -8,6 +8,21 @@ import (
 
 const defaultFakeReadURL = "https://example.com"
 
+type actionEnvelope[T any] struct {
+	Action  string `json:"action"`
+	Content T      `json:"content"`
+}
+
+type fakeReadAction struct {
+	URL    string `json:"url"`
+	Reason string `json:"reason"`
+}
+
+type fakeFinalAction struct {
+	Answer string `json:"answer"`
+	Reason string `json:"reason"`
+}
+
 // FakeClient returns deterministic actions for tests and local demos.
 type FakeClient struct {
 	ReadURL string
@@ -32,25 +47,21 @@ func (c *FakeClient) ChatWithMessages(messages []Message) (ChatResponse, error) 
 		}
 	}
 	if observation == "" {
-		return marshalAction(struct {
-			Action string `json:"action"`
-			URL    string `json:"url"`
-			Reason string `json:"reason"`
-		}{
+		return marshalAction(actionEnvelope[fakeReadAction]{
 			Action: "read",
-			URL:    c.readURL(),
-			Reason: "fake client reads the configured URL",
+			Content: fakeReadAction{
+				URL:    c.readURL(),
+				Reason: "fake client reads the configured URL",
+			},
 		})
 	}
 
-	return marshalAction(struct {
-		Action string `json:"action"`
-		Answer string `json:"answer"`
-		Reason string `json:"reason"`
-	}{
+	return marshalAction(actionEnvelope[fakeFinalAction]{
 		Action: "final",
-		Answer: "Read result: " + compactObservation(observation),
-		Reason: "fake client observed a read result",
+		Content: fakeFinalAction{
+			Answer: "Read result: " + compactObservation(observation),
+			Reason: "fake client observed a read result",
+		},
 	})
 }
 

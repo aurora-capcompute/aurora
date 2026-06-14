@@ -111,9 +111,6 @@ func TestTinyGoGuestThroughCapcomputeWithFakeLLM(t *testing.T) {
 	if !strings.Contains(string(result.Output), "tinygo integration content") {
 		t.Fatalf("output does not include read content: %s", result.Output)
 	}
-	if !strings.Contains(string(result.Output), `"action":"read"`) {
-		t.Fatalf("output does not include step trace: %s", result.Output)
-	}
 }
 
 func buildGuest(t *testing.T) string {
