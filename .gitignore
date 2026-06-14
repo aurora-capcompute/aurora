@@ -1,0 +1,31 @@
+# IDE/editor state
+.idea/
+.vscode/
+*.iml
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# Temporary files
+tmp/
+temp/
+.tmp/
+*.tmp
+*.swp
+*~
+
+# Go build/test artifacts
+bin/
+build/
+dist/
+coverage.out
+*.test
+
+# TinyGo/Wasm build artifacts
+*.wasm
+*.wat

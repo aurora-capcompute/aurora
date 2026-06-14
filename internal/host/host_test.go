@@ -15,8 +15,8 @@ import (
 
 type run struct{}
 
-func TestHandlersLLMChatReturnsFakeContent(t *testing.T) {
-	handlers := internalhost.Handlers[run]{
+func TestDispatcherLLMChatReturnsFakeContent(t *testing.T) {
+	dispatch := &internalhost.Dispatcher[run]{
 		LLM: llm.NewFakeClient("https://example.com"),
 	}
 	args := mustJSON(t, llm.ChatRequest{
@@ -24,7 +24,7 @@ func TestHandlersLLMChatReturnsFakeContent(t *testing.T) {
 		JSON:     true,
 	})
 
-	outcome, err := handlers.Execute(context.Background(), run{}, dispatcher.Call{Name: "llm.chat", Args: args})
+	outcome, err := dispatch.Dispatch(context.Background(), run{}, dispatcher.Call{Name: "llm.chat", Args: args})
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -47,7 +47,7 @@ func TestHandlersLLMChatReturnsFakeContent(t *testing.T) {
 	}
 }
 
-func TestHandlersInternetReadReturnsAllowedResource(t *testing.T) {
+func TestDispatcherInternetReadReturnsAllowedResource(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write([]byte("allowed"))
@@ -58,12 +58,12 @@ func TestHandlersInternetReadReturnsAllowedResource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse policy: %v", err)
 	}
-	handlers := internalhost.Handlers[run]{
+	dispatch := &internalhost.Dispatcher[run]{
 		Internet: internet.NewClient(policy),
 	}
 	args := mustJSON(t, internet.ReadRequest{Method: "GET", URL: server.URL})
 
-	outcome, err := handlers.Execute(context.Background(), run{}, dispatcher.Call{Name: "internet.read", Args: args})
+	outcome, err := dispatch.Dispatch(context.Background(), run{}, dispatcher.Call{Name: "internet.read", Args: args})
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -79,10 +79,10 @@ func TestHandlersInternetReadReturnsAllowedResource(t *testing.T) {
 	}
 }
 
-func TestHandlersUnknownCallReturnsFailedOutcome(t *testing.T) {
-	handlers := internalhost.Handlers[run]{}
+func TestDispatcherUnknownCallReturnsFailedOutcome(t *testing.T) {
+	dispatch := &internalhost.Dispatcher[run]{}
 
-	outcome, err := handlers.Execute(context.Background(), run{}, dispatcher.Call{Name: "missing.call"})
+	outcome, err := dispatch.Dispatch(context.Background(), run{}, dispatcher.Call{Name: "missing.call"})
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
