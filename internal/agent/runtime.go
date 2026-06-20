@@ -63,7 +63,6 @@ type HistoryMessage struct {
 type Config struct {
 	WasmPath  string
 	LLM       llm.Client
-	Internet  internalhost.InternetReader
 	IDSource  func(prefix string) (string, error)
 	Now       func() time.Time
 	EventSize int
@@ -92,31 +91,35 @@ type threadState struct {
 	history     []HistoryMessage
 	runIDs      []string
 	activeRunID string
+	manifest    Manifest
 }
 
 type runState struct {
-	id              string
-	threadID        string
-	message         string
-	history         []HistoryMessage
-	status          RunStatus
-	attempt         int
-	createdAt       time.Time
-	updatedAt       time.Time
-	startedAt       *time.Time
-	completedAt     *time.Time
-	answer          string
-	err             string
-	journal         *observableJournal
-	session         *capcompute.Session[RunKey]
-	handle          *capcompute.PlayHandle[RunKey]
-	stopRequested   bool
-	preserveSession bool
+	id                string
+	threadID          string
+	message           string
+	history           []HistoryMessage
+	status            RunStatus
+	attempt           int
+	createdAt         time.Time
+	updatedAt         time.Time
+	startedAt         *time.Time
+	completedAt       *time.Time
+	answer            string
+	err               string
+	journal           *observableJournal
+	session           *capcompute.Session[RunKey]
+	handle            *capcompute.PlayHandle[RunKey]
+	stopRequested     bool
+	preserveSession   bool
+	effectiveManifest Manifest
 }
 
 type agentInput struct {
-	Message string           `json:"message"`
-	History []HistoryMessage `json:"history,omitempty"`
+	Message      string                  `json:"message"`
+	History      []HistoryMessage        `json:"history,omitempty"`
+	SystemPrompt string                  `json:"system_prompt,omitempty"`
+	Capabilities []dispatcher.Capability `json:"capabilities,omitempty"`
 }
 
 type agentOutput struct {
@@ -131,6 +134,7 @@ type ThreadSummary struct {
 	UpdatedAt   time.Time `json:"updated_at"`
 	RunCount    int       `json:"run_count"`
 	ActiveRunID string    `json:"active_run_id,omitempty"`
+	Manifest    Manifest  `json:"manifest"`
 }
 
 type ThreadSnapshot struct {
@@ -140,18 +144,19 @@ type ThreadSnapshot struct {
 }
 
 type RunSnapshot struct {
-	ID            string     `json:"id"`
-	ThreadID      string     `json:"thread_id"`
-	Message       string     `json:"message"`
-	Status        RunStatus  `json:"status"`
-	Attempt       int        `json:"attempt"`
-	Answer        string     `json:"answer,omitempty"`
-	Error         string     `json:"error,omitempty"`
-	JournalLength int        `json:"journal_length"`
-	CreatedAt     time.Time  `json:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at"`
-	StartedAt     *time.Time `json:"started_at,omitempty"`
-	CompletedAt   *time.Time `json:"completed_at,omitempty"`
+	ID                string     `json:"id"`
+	ThreadID          string     `json:"thread_id"`
+	Message           string     `json:"message"`
+	Status            RunStatus  `json:"status"`
+	Attempt           int        `json:"attempt"`
+	Answer            string     `json:"answer,omitempty"`
+	Error             string     `json:"error,omitempty"`
+	JournalLength     int        `json:"journal_length"`
+	CreatedAt         time.Time  `json:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at"`
+	StartedAt         *time.Time `json:"started_at,omitempty"`
+	CompletedAt       *time.Time `json:"completed_at,omitempty"`
+	EffectiveManifest Manifest   `json:"effective_manifest"`
 }
 
 type JournalEntry struct {
@@ -184,9 +189,6 @@ func NewRuntime(ctx context.Context, config Config) (*Runtime, error) {
 	if config.LLM == nil {
 		return nil, fmt.Errorf("%w: llm client is required", ErrInvalid)
 	}
-	if config.Internet == nil {
-		return nil, fmt.Errorf("%w: internet reader is required", ErrInvalid)
-	}
 	runtime := &Runtime{
 		store:       session_store_memory.New[string, RunKey](),
 		threads:     make(map[string]*threadState),
@@ -212,8 +214,19 @@ func NewRuntime(ctx context.Context, config Config) (*Runtime, error) {
 		},
 		PluginConfig: extism.PluginConfig{EnableWasi: true},
 		Dispatchers: internalhost.Factory[RunKey]{
-			LLM:      config.LLM,
-			Internet: config.Internet,
+			Resolve: func(_ context.Context, key RunKey) (internalhost.Config, error) {
+				runtime.mu.Lock()
+				run := runtime.runs[key.ID]
+				var manifest Manifest
+				if run != nil {
+					manifest = cloneManifest(run.effectiveManifest)
+				}
+				runtime.mu.Unlock()
+				if run == nil {
+					return internalhost.Config{}, fmt.Errorf("%w: run %s", ErrNotFound, key.ID)
+				}
+				return DispatcherConfig(manifest, config.LLM)
+			},
 			NewTape: func(_ context.Context, key RunKey) (replay.Tape, error) {
 				runtime.mu.Lock()
 				run := runtime.runs[key.ID]
@@ -233,13 +246,17 @@ func NewRuntime(ctx context.Context, config Config) (*Runtime, error) {
 	return runtime, nil
 }
 
-func (r *Runtime) CreateThread() (ThreadSnapshot, error) {
+func (r *Runtime) CreateThread(manifest Manifest) (ThreadSnapshot, error) {
+	manifest, err := ValidateManifest(manifest)
+	if err != nil {
+		return ThreadSnapshot{}, err
+	}
 	id, err := r.idSource("thr_")
 	if err != nil {
 		return ThreadSnapshot{}, err
 	}
 	now := r.now().UTC()
-	thread := &threadState{id: id, title: "New thread", createdAt: now, updatedAt: now}
+	thread := &threadState{id: id, title: "New thread", createdAt: now, updatedAt: now, manifest: manifest}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -270,7 +287,7 @@ func (r *Runtime) GetThread(threadID string) (ThreadSnapshot, error) {
 	return r.threadSnapshotLocked(thread), nil
 }
 
-func (r *Runtime) CreateRun(threadID string, message string) (RunSnapshot, error) {
+func (r *Runtime) CreateRun(threadID string, message string, overrides []CapabilityConfig) (RunSnapshot, error) {
 	if message == "" {
 		return RunSnapshot{}, fmt.Errorf("%w: message is required", ErrInvalid)
 	}
@@ -294,15 +311,21 @@ func (r *Runtime) CreateRun(threadID string, message string) (RunSnapshot, error
 		r.mu.Unlock()
 		return RunSnapshot{}, fmt.Errorf("%w: thread already has active run %s", ErrConflict, thread.activeRunID)
 	}
+	effectiveManifest, err := EffectiveManifest(thread.manifest, overrides)
+	if err != nil {
+		r.mu.Unlock()
+		return RunSnapshot{}, err
+	}
 	run := &runState{
-		id:        runID,
-		threadID:  threadID,
-		message:   message,
-		history:   append([]HistoryMessage(nil), thread.history...),
-		status:    RunQueued,
-		attempt:   1,
-		createdAt: now,
-		updatedAt: now,
+		id:                runID,
+		threadID:          threadID,
+		message:           message,
+		history:           append([]HistoryMessage(nil), thread.history...),
+		status:            RunQueued,
+		attempt:           1,
+		createdAt:         now,
+		updatedAt:         now,
+		effectiveManifest: effectiveManifest,
 	}
 	run.journal = r.newJournal(run)
 	r.runs[runID] = run
@@ -399,7 +422,7 @@ func (r *Runtime) Stop(runID string) (RunSnapshot, error) {
 	return snapshot, nil
 }
 
-func (r *Runtime) Retry(runID string, mode RetryMode) (RunSnapshot, error) {
+func (r *Runtime) Retry(runID string, mode RetryMode, overrides []CapabilityConfig) (RunSnapshot, error) {
 	if mode != RetryResume && mode != RetryRestart {
 		return RunSnapshot{}, fmt.Errorf("%w: retry mode must be resume or restart", ErrInvalid)
 	}
@@ -426,11 +449,27 @@ func (r *Runtime) Retry(runID string, mode RetryMode) (RunSnapshot, error) {
 		return RunSnapshot{}, fmt.Errorf("%w: thread already has active run %s", ErrConflict, thread.activeRunID)
 	}
 
+	if mode != RetryRestart && len(overrides) > 0 {
+		r.mu.Unlock()
+		return RunSnapshot{}, fmt.Errorf("%w: capability overrides require restart mode", ErrInvalid)
+	}
+	var replacementManifest *Manifest
+	if len(overrides) > 0 {
+		effective, err := EffectiveManifest(thread.manifest, overrides)
+		if err != nil {
+			r.mu.Unlock()
+			return RunSnapshot{}, err
+		}
+		replacementManifest = &effective
+	}
 	if mode == RetryRestart {
 		run.journal = r.newJournal(run)
 		run.preserveSession = false
 	} else {
 		run.preserveSession = run.status == RunYielded
+	}
+	if replacementManifest != nil {
+		run.effectiveManifest = *replacementManifest
 	}
 	run.status = RunQueued
 	run.attempt++
@@ -539,29 +578,32 @@ func (r *Runtime) execute(runID string) {
 		r.publish(threadID, Event{Type: "run.updated", Data: snapshot})
 		return
 	}
-	input, err := json.Marshal(agentInput{Message: run.message, History: run.history})
-	if err != nil {
-		r.finishLocked(run, RunFailed, "", err)
-		snapshot := r.runSnapshotLocked(run)
-		threadID := run.threadID
-		r.mu.Unlock()
-		r.publish(threadID, Event{Type: "run.updated", Data: snapshot})
-		return
-	}
 	session := run.session
 	preserve := run.preserveSession && session != nil
 	run.preserveSession = false
 	r.mu.Unlock()
 
 	if !preserve {
+		var err error
 		if session != nil {
 			_ = session.Close(context.Background())
 		}
 		session, err = r.compute.CreateSession(context.Background(), capcompute.PlayRequest[string, RunKey]{
-			Input:      input,
 			Entrypoint: "run",
 			UserData:   RunKey{ID: runID},
 		})
+		if err == nil {
+			var input []byte
+			input, err = json.Marshal(agentInput{
+				Message:      run.message,
+				History:      run.history,
+				SystemPrompt: run.effectiveManifest.SystemPrompt,
+				Capabilities: session.Capabilities(),
+			})
+			if err == nil {
+				session.Input = input
+			}
+		}
 		if err == nil {
 			err = r.store.SaveSession(context.Background(), runID, session)
 		}
@@ -702,6 +744,7 @@ func (r *Runtime) threadSummaryLocked(thread *threadState) ThreadSummary {
 		UpdatedAt:   thread.updatedAt,
 		RunCount:    len(thread.runIDs),
 		ActiveRunID: thread.activeRunID,
+		Manifest:    cloneManifest(thread.manifest),
 	}
 }
 
@@ -738,18 +781,19 @@ func (r *Runtime) runSnapshotLocked(run *runState) RunSnapshot {
 		journalLength = run.journal.Length()
 	}
 	return RunSnapshot{
-		ID:            run.id,
-		ThreadID:      run.threadID,
-		Message:       run.message,
-		Status:        run.status,
-		Attempt:       run.attempt,
-		Answer:        run.answer,
-		Error:         run.err,
-		JournalLength: journalLength,
-		CreatedAt:     run.createdAt,
-		UpdatedAt:     run.updatedAt,
-		StartedAt:     copyTime(run.startedAt),
-		CompletedAt:   copyTime(run.completedAt),
+		ID:                run.id,
+		ThreadID:          run.threadID,
+		Message:           run.message,
+		Status:            run.status,
+		Attempt:           run.attempt,
+		Answer:            run.answer,
+		Error:             run.err,
+		JournalLength:     journalLength,
+		CreatedAt:         run.createdAt,
+		UpdatedAt:         run.updatedAt,
+		StartedAt:         copyTime(run.startedAt),
+		CompletedAt:       copyTime(run.completedAt),
+		EffectiveManifest: cloneManifest(run.effectiveManifest),
 	}
 }
 

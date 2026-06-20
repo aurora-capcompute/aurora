@@ -63,6 +63,18 @@ func TestDisallowedMethodFails(t *testing.T) {
 	}
 }
 
+func TestWildcardAllowsAnyHTTPOrigin(t *testing.T) {
+	policy := mustPolicy(t, "GET:*")
+	for _, target := range []string{"https://example.com/path", "http://localhost:8080/value"} {
+		if err := policy.Allows(http.MethodGet, target); err != nil {
+			t.Fatalf("allow %s: %v", target, err)
+		}
+	}
+	if err := policy.Allows(http.MethodPost, "https://example.com"); err == nil {
+		t.Fatal("wildcard unexpectedly allowed POST")
+	}
+}
+
 func TestNonHTTPSchemeFails(t *testing.T) {
 	client := internet.NewClient(mustPolicy(t, "GET:https://example.com"))
 

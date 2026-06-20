@@ -37,6 +37,7 @@ type rule struct {
 	method string
 	scheme string
 	host   string
+	all    bool
 }
 
 func ParseAllowlist(raw string) (Policy, error) {
@@ -59,7 +60,12 @@ func ParseAllowlist(raw string) (Policy, error) {
 		if method == "" {
 			return Policy{}, fmt.Errorf("allowlist entry %q has empty method", entry)
 		}
-		parsed, err := url.Parse(strings.TrimSpace(origin))
+		origin = strings.TrimSpace(origin)
+		if origin == "*" {
+			rules = append(rules, rule{method: method, all: true})
+			continue
+		}
+		parsed, err := url.Parse(origin)
 		if err != nil {
 			return Policy{}, fmt.Errorf("parse allowlist entry %q: %w", entry, err)
 		}
@@ -101,7 +107,7 @@ func (p Policy) Check(method string, target *url.URL) error {
 	scheme := strings.ToLower(target.Scheme)
 	host := strings.ToLower(target.Host)
 	for _, rule := range p.rules {
-		if rule.method == method && rule.scheme == scheme && rule.host == host {
+		if rule.method == method && (rule.all || rule.scheme == scheme && rule.host == host) {
 			return nil
 		}
 	}
@@ -124,10 +130,20 @@ type Client struct {
 }
 
 func NewClient(policy Policy) *Client {
+	return NewConfiguredClient(policy, DefaultTimeout, DefaultMaxResponseBytes)
+}
+
+func NewConfiguredClient(policy Policy, timeout time.Duration, maxBytes int64) *Client {
+	if timeout <= 0 {
+		timeout = DefaultTimeout
+	}
+	if maxBytes <= 0 {
+		maxBytes = DefaultMaxResponseBytes
+	}
 	client := &Client{
 		Policy:   policy,
-		Timeout:  DefaultTimeout,
-		MaxBytes: DefaultMaxResponseBytes,
+		Timeout:  timeout,
+		MaxBytes: maxBytes,
 	}
 	client.HTTPClient = &http.Client{
 		Timeout: client.Timeout,

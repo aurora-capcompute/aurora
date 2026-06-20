@@ -8,11 +8,12 @@ The TinyGo guest owns the agent loop and calls only `extism:host/compute/play`.
 The Go host owns all side effects: `llm.chat` and `internet.read`. The guest does
 not use Extism built-in HTTP or Extism network policy.
 
-Each model turn returns a JSON action array. The guest executes batched
+Each model turn returns a JSON object containing an `actions` array. The guest executes batched
 `internet.read` actions sequentially and sends their results back as one
 aggregated observation array before asking the model for its next action batch.
 For compatibility with imperfect model output, the guest also accepts
-whitespace-delimited action objects and a JSON string containing either form.
+bare action arrays, whitespace-delimited action objects, and a JSON string
+containing any accepted form.
 
 ## Layout
 
@@ -43,23 +44,58 @@ process:
 sh guest/build.sh
 
 AURORA_LLM=openai \
-AURORA_HTTP_ALLOW=GET:https://go.dev \
 go run ./cmd/aurora-server
 ```
 
 The default address is `127.0.0.1:8080`; override it with
 `AURORA_SERVER_ADDR`.
 
-Create a thread and send its first message:
+Create a thread with an immutable default manifest and send its first message:
 
 ```sh
-curl -sS -X POST http://127.0.0.1:8080/v1/threads
+curl -sS -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "manifest": {
+      "version": 1,
+      "system_prompt": "You are a careful research assistant.",
+      "capabilities": [{
+        "name": "internet.read",
+        "settings": {
+          "allow": ["https://go.dev"],
+          "timeout_ms": 10000,
+          "max_response_bytes": 65536
+        }
+      }]
+    }
+  }' \
+  http://127.0.0.1:8080/v1/threads
 
 curl -sS -X POST \
   -H 'Content-Type: application/json' \
   -d '{"content":"Research the Go 1.26 release."}' \
   http://127.0.0.1:8080/v1/threads/THREAD_ID/messages
 ```
+
+Capability settings may be replaced for one run:
+
+```json
+{
+  "content": "Read any required public source.",
+  "capability_overrides": [{
+    "name": "internet.read",
+    "settings": {
+      "allow": ["*"],
+      "timeout_ms": 10000,
+      "max_response_bytes": 65536
+    }
+  }]
+}
+```
+
+`allow: ["*"]` permits GET requests to any HTTP or HTTPS origin. URL
+credentials, non-textual responses, oversized bodies, non-GET methods, and
+disallowed redirect targets remain protected by the host.
 
 Inspect a run or its complete journal:
 
@@ -85,14 +121,22 @@ curl -sS -X POST \
   http://127.0.0.1:8080/v1/runs/RUN_ID/retry
 ```
 
-`resume` preserves the journal and replays committed calls. `restart` replaces
-the journal and reruns the turn from scratch. Only the latest run in a thread
-can be retried.
+`resume` preserves the journal, effective manifest, and physical yielded
+session. `restart` replaces the journal and reruns the turn from scratch.
+`restart` may include new `capability_overrides` for explicit privilege
+escalation. Only the latest run in a thread can be retried.
 
 Each user message creates a fresh Wasm session. The new session receives only
 completed user/assistant message pairs from the thread, not previous tool calls
 or downloaded pages. A yielded run remains the active thread run until retried
 or stopped.
+
+Capability metadata is exported by the exact configured dispatcher chain and
+copied into the guest input. For every session, the guest appends a generated
+tool-calling protocol to the user-supplied system prompt. It lists only the
+tools exposed by that session's dispatcher, including their manifest-derived
+descriptions and input schemas. The guest forwards model actions generically by
+capability name. `final` remains the only guest-reserved action.
 
 The server has no authentication or CORS policy. It stores everything in memory,
 so all state disappears when the process exits.
@@ -105,7 +149,7 @@ server, avoiding any CORS requirement.
 
 - `AURORA_LLM=fake|openai`, default `fake`.
 - `AURORA_FAKE_READ_URL`, default `https://example.com`.
-- `AURORA_HTTP_ALLOW`, for example `GET:https://example.com,GET:https://docs.example.org`.
+- `AURORA_HTTP_ALLOW`, CLI-only fallback manifest, for example `GET:https://example.com`.
 - `AURORA_GUEST_WASM`, default `guest/agent.wasm`.
 - `AURORA_SERVER_ADDR`, default `127.0.0.1:8080`.
 - `AURORA_MESSAGE`, or pass the message as CLI arguments.

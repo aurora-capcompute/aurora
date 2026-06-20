@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -44,18 +45,18 @@ func (unusedInternet) Read(context.Context, internet.ReadRequest) (internet.Read
 func TestRuntimeCarriesOnlyCompactCompletedHistory(t *testing.T) {
 	model := &finalLLM{}
 	runtime := newTestRuntime(t, model)
-	thread, err := runtime.CreateThread()
+	thread, err := runtime.CreateThread(Manifest{Version: ManifestVersion})
 	if err != nil {
 		t.Fatalf("create thread: %v", err)
 	}
 
-	first, err := runtime.CreateRun(thread.ID, "first question")
+	first, err := runtime.CreateRun(thread.ID, "first question", nil)
 	if err != nil {
 		t.Fatalf("create first run: %v", err)
 	}
 	waitForStatus(t, runtime, first.ID, RunCompleted)
 
-	second, err := runtime.CreateRun(thread.ID, "second question")
+	second, err := runtime.CreateRun(thread.ID, "second question", nil)
 	if err != nil {
 		t.Fatalf("create second run: %v", err)
 	}
@@ -102,7 +103,7 @@ func TestRuntimeCarriesOnlyCompactCompletedHistory(t *testing.T) {
 func TestThreadTitleUsesFirstMessagePreview(t *testing.T) {
 	model := &finalLLM{}
 	runtime := newTestRuntime(t, model)
-	thread, err := runtime.CreateThread()
+	thread, err := runtime.CreateThread(Manifest{Version: ManifestVersion})
 	if err != nil {
 		t.Fatalf("create thread: %v", err)
 	}
@@ -111,7 +112,7 @@ func TestThreadTitleUsesFirstMessagePreview(t *testing.T) {
 	}
 
 	message := strings.Repeat("界", 61)
-	run, err := runtime.CreateRun(thread.ID, "  "+message+"  ")
+	run, err := runtime.CreateRun(thread.ID, "  "+message+"  ", nil)
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
@@ -124,6 +125,92 @@ func TestThreadTitleUsesFirstMessagePreview(t *testing.T) {
 	want := strings.Repeat("界", 60) + "…"
 	if updated.Title != want {
 		t.Fatalf("title = %q, want %q", updated.Title, want)
+	}
+}
+
+func TestRunSnapshotsEffectiveManifest(t *testing.T) {
+	model := &finalLLM{}
+	runtime := newTestRuntime(t, model)
+	thread, err := runtime.CreateThread(Manifest{
+		Version:      ManifestVersion,
+		SystemPrompt: "thread prompt",
+		Capabilities: []CapabilityConfig{{
+			Name:     "internet.read",
+			Settings: json.RawMessage(`{"allow":["https://go.dev"]}`),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("create thread: %v", err)
+	}
+	run, err := runtime.CreateRun(thread.ID, "question", []CapabilityConfig{{
+		Name:     "internet.read",
+		Settings: json.RawMessage(`{"allow":["*"]}`),
+	}})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	completed := waitForStatus(t, runtime, run.ID, RunCompleted)
+	if completed.EffectiveManifest.SystemPrompt != "thread prompt" {
+		t.Fatalf("system prompt = %q", completed.EffectiveManifest.SystemPrompt)
+	}
+	if !strings.Contains(string(completed.EffectiveManifest.Capabilities[0].Settings), `"*"`) {
+		t.Fatalf("effective settings = %s", completed.EffectiveManifest.Capabilities[0].Settings)
+	}
+	requests := model.Requests()
+	if len(requests) != 1 {
+		t.Fatalf("llm requests = %d, want 1", len(requests))
+	}
+	var systemMessages []string
+	for _, message := range requests[0].Messages {
+		if message.Role == "system" {
+			systemMessages = append(systemMessages, message.Content)
+		}
+	}
+	if len(systemMessages) != 1 {
+		t.Fatalf("system messages = %d, want one generated prompt", len(systemMessages))
+	}
+	prompt := systemMessages[0]
+	for _, expected := range []string{
+		"thread prompt",
+		"Available tools for this run:",
+		"Name: internet.read",
+		"Allowed origins: *",
+		`"const":"GET"`,
+		`{"actions":[{"action":"<exact tool name>"`,
+	} {
+		if !strings.Contains(prompt, expected) {
+			t.Fatalf("generated system prompt does not contain %q:\n%s", expected, prompt)
+		}
+	}
+	if strings.Contains(prompt, "https://go.dev") {
+		t.Fatalf("generated system prompt leaked base capability settings after override:\n%s", prompt)
+	}
+}
+
+func TestRuntimeGeneratesFinalOnlyProtocolWithoutCapabilities(t *testing.T) {
+	model := &finalLLM{}
+	runtime := newTestRuntime(t, model)
+	thread, err := runtime.CreateThread(Manifest{
+		Version:      ManifestVersion,
+		SystemPrompt: "Answer concisely.",
+	})
+	if err != nil {
+		t.Fatalf("create thread: %v", err)
+	}
+	run, err := runtime.CreateRun(thread.ID, "question", nil)
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	waitForStatus(t, runtime, run.ID, RunCompleted)
+
+	requests := model.Requests()
+	if len(requests) != 1 || len(requests[0].Messages) == 0 {
+		t.Fatalf("requests = %+v", requests)
+	}
+	prompt := requests[0].Messages[0].Content
+	if !strings.Contains(prompt, "Answer concisely.") ||
+		!strings.Contains(prompt, "Available tools for this run:\nNone.") {
+		t.Fatalf("generated final-only prompt = %q", prompt)
 	}
 }
 
@@ -144,11 +231,11 @@ func (c *stopThenFinishLLM) Chat(ctx context.Context, _ llm.ChatRequest) (llm.Ch
 func TestRuntimeStopsAndResumesRun(t *testing.T) {
 	model := &stopThenFinishLLM{started: make(chan struct{})}
 	runtime := newTestRuntime(t, model)
-	thread, err := runtime.CreateThread()
+	thread, err := runtime.CreateThread(Manifest{Version: ManifestVersion})
 	if err != nil {
 		t.Fatalf("create thread: %v", err)
 	}
-	run, err := runtime.CreateRun(thread.ID, "long request")
+	run, err := runtime.CreateRun(thread.ID, "long request", nil)
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
@@ -157,7 +244,7 @@ func TestRuntimeStopsAndResumesRun(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("llm call did not start")
 	}
-	if _, err := runtime.CreateRun(thread.ID, "conflicting request"); !errors.Is(err, ErrConflict) {
+	if _, err := runtime.CreateRun(thread.ID, "conflicting request", nil); !errors.Is(err, ErrConflict) {
 		t.Fatalf("concurrent run error = %v, want conflict", err)
 	}
 	if _, err := runtime.Stop(run.ID); err != nil {
@@ -165,7 +252,7 @@ func TestRuntimeStopsAndResumesRun(t *testing.T) {
 	}
 	waitForStatus(t, runtime, run.ID, RunStopped)
 
-	retried, err := runtime.Retry(run.ID, RetryResume)
+	retried, err := runtime.Retry(run.ID, RetryResume, nil)
 	if err != nil {
 		t.Fatalf("resume run: %v", err)
 	}
@@ -183,7 +270,6 @@ func newTestRuntime(t *testing.T, model llm.Client) *Runtime {
 	runtime, err := NewRuntime(context.Background(), Config{
 		WasmPath: buildGuest(t),
 		LLM:      model,
-		Internet: unusedInternet{},
 		IDSource: sequentialIDs(),
 	})
 	if err != nil {

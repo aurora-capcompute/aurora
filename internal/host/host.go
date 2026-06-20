@@ -16,26 +16,48 @@ type InternetReader interface {
 }
 
 type Factory[K any] struct {
-	LLM      llm.Client
-	Internet InternetReader
-	NewTape  TapeFactory[K]
+	LLM          llm.Client
+	Internet     InternetReader
+	Capabilities []dispatcher.Capability
+	Resolve      ConfigResolver[K]
+	NewTape      TapeFactory[K]
 }
 
 type TapeFactory[K any] func(ctx context.Context, key K) (replay.Tape, error)
+type ConfigResolver[K any] func(ctx context.Context, key K) (Config, error)
+
+type Config struct {
+	LLM          llm.Client
+	Internet     InternetReader
+	Capabilities []dispatcher.Capability
+}
 
 func (f Factory[K]) NewDispatcher(ctx context.Context, key K) (dispatcher.Dispatcher[K], error) {
-	next := &Dispatcher[K]{
-		LLM:      f.LLM,
-		Internet: f.Internet,
+	config := Config{
+		LLM:          f.LLM,
+		Internet:     f.Internet,
+		Capabilities: f.Capabilities,
 	}
+	if f.Resolve != nil {
+		var err error
+		config, err = f.Resolve(ctx, key)
+		if err != nil {
+			return nil, err
+		}
+	}
+	next := &Dispatcher[K]{
+		LLM:      config.LLM,
+		Internet: config.Internet,
+	}
+	var configured dispatcher.Dispatcher[K] = dispatcher.WithCapabilities[K](next, config.Capabilities)
 	if f.NewTape == nil {
-		return next, nil
+		return configured, nil
 	}
 	tape, err := f.NewTape(ctx, key)
 	if err != nil {
 		return nil, err
 	}
-	return replay.NewDispatcher[K](tape, next), nil
+	return replay.NewDispatcher[K](tape, configured), nil
 }
 
 type Dispatcher[K any] struct {

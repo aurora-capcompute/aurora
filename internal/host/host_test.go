@@ -35,16 +35,22 @@ func TestDispatcherLLMChatReturnsFakeContent(t *testing.T) {
 	if err := json.Unmarshal(outcome.Result(), &response); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	var actions []struct {
-		Action  string `json:"action"`
-		Content struct {
-			URL string `json:"url"`
-		} `json:"content"`
+	var batch struct {
+		Actions []struct {
+			Action  string `json:"action"`
+			Content struct {
+				Method string `json:"method"`
+				URL    string `json:"url"`
+			} `json:"content"`
+		} `json:"actions"`
 	}
-	if err := json.Unmarshal([]byte(response.Content), &actions); err != nil {
+	if err := json.Unmarshal([]byte(response.Content), &batch); err != nil {
 		t.Fatalf("decode action: %v", err)
 	}
-	if len(actions) != 1 || actions[0].Action != "read" || actions[0].Content.URL != "https://example.com" {
+	actions := batch.Actions
+	if len(actions) != 1 || actions[0].Action != "internet.read" ||
+		actions[0].Content.Method != http.MethodGet ||
+		actions[0].Content.URL != "https://example.com" {
 		t.Fatalf("actions = %+v", actions)
 	}
 }

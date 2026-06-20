@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"aurora-capcompute/internal/agent"
-	"aurora-capcompute/internal/internet"
 	"aurora-capcompute/internal/llm"
 	auroraserver "aurora-capcompute/internal/server"
 )
@@ -32,14 +31,9 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	policy, err := internet.ParseAllowlist(os.Getenv("AURORA_HTTP_ALLOW"))
-	if err != nil {
-		return fmt.Errorf("parse AURORA_HTTP_ALLOW: %w", err)
-	}
 	runtime, err := agent.NewRuntime(ctx, agent.Config{
 		WasmPath: envDefault("AURORA_GUEST_WASM", "guest/agent.wasm"),
 		LLM:      llmClient,
-		Internet: internet.NewClient(policy),
 	})
 	if err != nil {
 		return fmt.Errorf("create agent runtime: %w", err)

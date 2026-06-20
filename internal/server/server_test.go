@@ -37,7 +37,6 @@ func TestRESTAndSSELifecycle(t *testing.T) {
 	runtime, err := agent.NewRuntime(context.Background(), agent.Config{
 		WasmPath: buildGuest(t),
 		LLM:      finalLLM{},
-		Internet: unusedInternet{},
 		IDSource: sequentialIDs(),
 	})
 	if err != nil {
@@ -53,7 +52,9 @@ func TestRESTAndSSELifecycle(t *testing.T) {
 	httpServer := httptest.NewServer(New(runtime).Handler())
 	defer httpServer.Close()
 
-	thread := requestJSON[agent.ThreadSnapshot](t, http.MethodPost, httpServer.URL+"/v1/threads", nil, http.StatusCreated)
+	thread := requestJSON[agent.ThreadSnapshot](t, http.MethodPost, httpServer.URL+"/v1/threads",
+		map[string]any{"manifest": map[string]any{"version": 1, "capabilities": []any{}}},
+		http.StatusCreated)
 	if thread.ID == "" {
 		t.Fatal("thread id is empty")
 	}

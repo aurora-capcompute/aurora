@@ -14,6 +14,7 @@ type actionEnvelope[T any] struct {
 }
 
 type fakeReadAction struct {
+	Method string `json:"method"`
 	URL    string `json:"url"`
 	Reason string `json:"reason"`
 }
@@ -48,8 +49,9 @@ func (c *FakeClient) ChatWithMessages(messages []Message) (ChatResponse, error) 
 	}
 	if observation == "" {
 		return marshalActions([]actionEnvelope[fakeReadAction]{{
-			Action: "read",
+			Action: "internet.read",
 			Content: fakeReadAction{
+				Method: "GET",
 				URL:    c.readURL(),
 				Reason: "fake client reads the configured URL",
 			},
@@ -73,7 +75,9 @@ func (c *FakeClient) readURL() string {
 }
 
 func marshalActions(v any) (ChatResponse, error) {
-	data, err := json.Marshal(v)
+	data, err := json.Marshal(struct {
+		Actions any `json:"actions"`
+	}{Actions: v})
 	if err != nil {
 		return ChatResponse{}, err
 	}

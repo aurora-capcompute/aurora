@@ -15,8 +15,8 @@ import (
 	"strings"
 	"time"
 
+	"aurora-capcompute/internal/agent"
 	internalhost "aurora-capcompute/internal/host"
-	"aurora-capcompute/internal/internet"
 	"aurora-capcompute/internal/llm"
 
 	extism "github.com/extism/go-sdk"
@@ -31,7 +31,9 @@ func (r Run) SessionKey() string {
 }
 
 type agentInput struct {
-	Message string `json:"message"`
+	Message      string                  `json:"message"`
+	SystemPrompt string                  `json:"system_prompt,omitempty"`
+	Capabilities []dispatcher.Capability `json:"capabilities,omitempty"`
 }
 
 type executeResult struct {
@@ -74,9 +76,13 @@ func execute(ctx context.Context, args []string) (executeResult, error) {
 	if err != nil {
 		return executeResult{}, err
 	}
-	policy, err := internet.ParseAllowlist(os.Getenv("AURORA_HTTP_ALLOW"))
+	manifest, err := agent.DefaultManifest(os.Getenv("AURORA_HTTP_ALLOW"))
 	if err != nil {
-		return executeResult{}, fmt.Errorf("parse AURORA_HTTP_ALLOW: %w", err)
+		return executeResult{}, fmt.Errorf("build manifest: %w", err)
+	}
+	hostConfig, err := agent.DispatcherConfig(manifest, llmClient)
+	if err != nil {
+		return executeResult{}, fmt.Errorf("build dispatcher: %w", err)
 	}
 
 	wasmPath := envDefault("AURORA_GUEST_WASM", "guest/agent.wasm")
@@ -90,8 +96,9 @@ func execute(ctx context.Context, args []string) (executeResult, error) {
 			EnableWasi: true,
 		},
 		Dispatchers: internalhost.Factory[Run]{
-			LLM:      llmClient,
-			Internet: internet.NewClient(policy),
+			LLM:          hostConfig.LLM,
+			Internet:     hostConfig.Internet,
+			Capabilities: hostConfig.Capabilities,
 			NewTape: func(context.Context, Run) (replay.Tape, error) {
 				return journaled.NewTape(journal), nil
 			},
@@ -104,20 +111,23 @@ func execute(ctx context.Context, args []string) (executeResult, error) {
 	defer compute.CloseCompiled(context.Background())
 
 	run := Run{ID: envDefault("AURORA_RUN_ID", fmt.Sprintf("run-%d", time.Now().UnixNano()))}
-	input, err := json.Marshal(agentInput{
-		Message: messageFromArgs(args),
-	})
-	if err != nil {
-		return executeResult{}, fmt.Errorf("encode input: %w", err)
-	}
 	session, err := compute.CreateSession(ctx, capcompute.PlayRequest[string, Run]{
-		Input:      input,
 		Entrypoint: "run",
 		UserData:   run,
 	})
 	if err != nil {
 		return executeResult{}, fmt.Errorf("create session: %w", err)
 	}
+	input, err := json.Marshal(agentInput{
+		Message:      messageFromArgs(args),
+		SystemPrompt: manifest.SystemPrompt,
+		Capabilities: session.Capabilities(),
+	})
+	if err != nil {
+		_ = session.Close(ctx)
+		return executeResult{}, fmt.Errorf("encode input: %w", err)
+	}
+	session.Input = input
 	defer session.Close(context.Background())
 
 	if err := store.SaveSession(ctx, run.SessionKey(), session); err != nil {

@@ -32,6 +32,12 @@ type integrationRun struct {
 	id string
 }
 
+var integrationInternetCapability = dispatcher.Capability{
+	Name:        "internet.read",
+	Description: "Read textual content with HTTP GET.",
+	InputSchema: json.RawMessage(`{"type":"object"}`),
+}
+
 func (r integrationRun) SessionKey() string {
 	return r.id
 }
@@ -47,8 +53,9 @@ func (c *batchLLM) Chat(_ context.Context, request llm.ChatRequest) (llm.ChatRes
 		actions := make([]map[string]any, 0, len(c.urls))
 		for _, target := range c.urls {
 			actions = append(actions, map[string]any{
-				"action": "read",
+				"action": "internet.read",
 				"content": map[string]string{
+					"method": "GET",
 					"url":    target,
 					"reason": "batch integration test",
 				},
@@ -63,6 +70,7 @@ func (c *batchLLM) Chat(_ context.Context, request llm.ChatRequest) (llm.ChatRes
 			return llm.ChatResponse{}, err
 		}
 		stream := string(first) + "\n" + string(second)
+		stream += "\n" + `{"action":"final","content":{"answer":"premature answer before tool observations"}}`
 		stream += "\n" + `{"error":"invalid_format","message":"Expected a JSON array of actions"}`
 		encoded, err := json.Marshal(stream)
 		return llm.ChatResponse{Content: string(encoded)}, err
@@ -81,16 +89,76 @@ func (c *batchLLM) Chat(_ context.Context, request llm.ChatRequest) (llm.ChatRes
 			return llm.ChatResponse{}, fmt.Errorf("decode aggregate observations: %w", err)
 		}
 		if len(observations) != 2 ||
+			observations[0].Action != "internet.read" ||
+			observations[1].Action != "internet.read" ||
 			observations[0].Content.Body != "first source" ||
 			observations[1].Content.Body != "second source" {
 			return llm.ChatResponse{}, fmt.Errorf("unexpected aggregate observations: %+v", observations)
 		}
 		return llm.ChatResponse{
-			Content: `[{"action":"final","content":{"answer":"combined both sources"}}]`,
+			Content: `{"actions":[{"action":"final","content":{"answer":"combined both sources"}}]}`,
 		}, nil
 	default:
 		return llm.ChatResponse{}, fmt.Errorf("unexpected llm call")
 	}
+}
+
+type failureAwareLLM struct {
+	calls atomic.Int32
+}
+
+func (c *failureAwareLLM) Chat(_ context.Context, request llm.ChatRequest) (llm.ChatResponse, error) {
+	switch c.calls.Add(1) {
+	case 1:
+		return llm.ChatResponse{Content: `{"actions":[
+			{"action":"internet.read","content":{"method":"GET","url":"https://working.test"}},
+			{"action":"internet.read","content":{"method":"GET","url":"https://timeout.test"}}
+		]}`}, nil
+	case 2:
+		var toolContent string
+		for _, message := range request.Messages {
+			if message.Role == "tool" {
+				toolContent = message.Content
+			}
+		}
+		var observations []struct {
+			Action  string                `json:"action"`
+			Status  string                `json:"status"`
+			Content internet.ReadResponse `json:"content"`
+			Error   string                `json:"error"`
+		}
+		if err := json.Unmarshal([]byte(toolContent), &observations); err != nil {
+			return llm.ChatResponse{}, fmt.Errorf("decode failure observations: %w", err)
+		}
+		if len(observations) != 2 ||
+			observations[0].Status != "result" ||
+			observations[0].Content.Body != "usable source" ||
+			observations[1].Status != "failed" ||
+			!strings.Contains(observations[1].Error, "context deadline exceeded") {
+			return llm.ChatResponse{}, fmt.Errorf("unexpected failure observations: %+v", observations)
+		}
+		return llm.ChatResponse{
+			Content: `{"actions":[{"action":"final","content":{"answer":"answered from the usable source"}}]}`,
+		}, nil
+	default:
+		return llm.ChatResponse{}, fmt.Errorf("unexpected llm call")
+	}
+}
+
+type partiallyFailingReader struct{}
+
+func (partiallyFailingReader) Read(_ context.Context, request internet.ReadRequest) (internet.ReadResponse, error) {
+	if request.URL == "https://timeout.test" {
+		return internet.ReadResponse{}, fmt.Errorf(
+			`Get "https://timeout.test": context deadline exceeded (Client.Timeout exceeded while awaiting headers)`,
+		)
+	}
+	return internet.ReadResponse{
+		URL:         request.URL,
+		Status:      http.StatusOK,
+		ContentType: "text/plain",
+		Body:        "usable source",
+	}, nil
 }
 
 func TestTinyGoGuestThroughCapcomputeWithFakeLLM(t *testing.T) {
@@ -124,8 +192,9 @@ func TestTinyGoGuestThroughCapcomputeWithFakeLLM(t *testing.T) {
 			EnableWasi: true,
 		},
 		Dispatchers: internalhost.Factory[integrationRun]{
-			LLM:      llm.NewFakeClient(server.URL),
-			Internet: internet.NewClient(policy),
+			LLM:          llm.NewFakeClient(server.URL),
+			Internet:     internet.NewClient(policy),
+			Capabilities: []dispatcher.Capability{integrationInternetCapability},
 			NewTape: func(context.Context, integrationRun) (replay.Tape, error) {
 				return journaled.NewTape(journal), nil
 			},
@@ -142,9 +211,11 @@ func TestTinyGoGuestThroughCapcomputeWithFakeLLM(t *testing.T) {
 	})
 
 	input, err := json.Marshal(struct {
-		Message string `json:"message"`
+		Message      string                  `json:"message"`
+		Capabilities []dispatcher.Capability `json:"capabilities"`
 	}{
-		Message: "read the configured page",
+		Message:      "read the configured page",
+		Capabilities: []dispatcher.Capability{integrationInternetCapability},
 	})
 	if err != nil {
 		t.Fatalf("encode input: %v", err)
@@ -218,8 +289,9 @@ func TestTinyGoGuestExecutesAndAggregatesActionBatch(t *testing.T) {
 			EnableWasi: true,
 		},
 		Dispatchers: internalhost.Factory[integrationRun]{
-			LLM:      model,
-			Internet: internet.NewClient(policy),
+			LLM:          model,
+			Internet:     internet.NewClient(policy),
+			Capabilities: []dispatcher.Capability{integrationInternetCapability},
 			NewTape: func(context.Context, integrationRun) (replay.Tape, error) {
 				return journaled.NewTape(journal), nil
 			},
@@ -237,7 +309,7 @@ func TestTinyGoGuestExecutesAndAggregatesActionBatch(t *testing.T) {
 
 	run := integrationRun{id: "batch"}
 	session, err := compute.CreateSession(ctx, capcompute.PlayRequest[string, integrationRun]{
-		Input:      json.RawMessage(`{"message":"combine both sources"}`),
+		Input:      mustAgentInput(t, "combine both sources"),
 		Entrypoint: "run",
 		UserData:   run,
 	})
@@ -265,6 +337,76 @@ func TestTinyGoGuestExecutesAndAggregatesActionBatch(t *testing.T) {
 		t.Fatalf("output does not contain final answer: %s", result.Output)
 	}
 	assertRecordedCalls(t, journal, []string{"llm.chat", "internet.read", "internet.read", "llm.chat"})
+}
+
+func TestTinyGoGuestReturnsCapabilityFailureToModel(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping TinyGo integration test in short mode")
+	}
+	if _, err := exec.LookPath("tinygo"); err != nil {
+		t.Skip("tinygo not found")
+	}
+
+	ctx := context.Background()
+	journal := memory.NewJournal()
+	model := &failureAwareLLM{}
+	store := session_store_memory.New[string, integrationRun]()
+	compute, err := capcompute.NewComputeCompiledPlugin[string, integrationRun](ctx, capcompute.Config[string, integrationRun]{
+		Manifest: extism.Manifest{
+			Wasm: []extism.Wasm{extism.WasmFile{Path: buildGuest(t)}},
+		},
+		PluginConfig: extism.PluginConfig{EnableWasi: true},
+		Dispatchers: internalhost.Factory[integrationRun]{
+			LLM:          model,
+			Internet:     partiallyFailingReader{},
+			Capabilities: []dispatcher.Capability{integrationInternetCapability},
+			NewTape: func(context.Context, integrationRun) (replay.Tape, error) {
+				return journaled.NewTape(journal), nil
+			},
+		},
+		SessionStore: store,
+	})
+	if err != nil {
+		t.Fatalf("new compute plugin: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := compute.CloseCompiled(context.Background()); err != nil {
+			t.Errorf("close compiled: %v", err)
+		}
+	})
+
+	run := integrationRun{id: "capability-failure"}
+	session, err := compute.CreateSession(ctx, capcompute.PlayRequest[string, integrationRun]{
+		Input:      mustAgentInput(t, "research with both sources"),
+		Entrypoint: "run",
+		UserData:   run,
+	})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := session.Close(context.Background()); err != nil {
+			t.Errorf("close session: %v", err)
+		}
+	})
+	if err := store.SaveSession(ctx, run.SessionKey(), session); err != nil {
+		t.Fatalf("save session: %v", err)
+	}
+
+	handle, err := compute.Play(ctx, session)
+	if err != nil {
+		t.Fatalf("play: %v", err)
+	}
+	result := <-handle.Results()
+	if result.Status != capcompute.PlayCompleted || result.Err != nil {
+		t.Fatalf("result = %+v output=%s", result, result.Output)
+	}
+	if !strings.Contains(string(result.Output), "answered from the usable source") {
+		t.Fatalf("output does not contain final answer: %s", result.Output)
+	}
+	// The replay tape records successful results only. The failed read is
+	// deliberately not cached, but the guest still returns it to the model.
+	assertRecordedCalls(t, journal, []string{"llm.chat", "internet.read", "llm.chat"})
 }
 
 func assertRecordedCalls(t *testing.T, journal *memory.Journal, want []string) {
@@ -336,8 +478,9 @@ func TestForceStopCanRecoverThroughRecreatedSessionAndJournal(t *testing.T) {
 			EnableWasi: true,
 		},
 		Dispatchers: internalhost.Factory[integrationRun]{
-			LLM:      model,
-			Internet: reader,
+			LLM:          model,
+			Internet:     reader,
+			Capabilities: []dispatcher.Capability{integrationInternetCapability},
 			NewTape: func(context.Context, integrationRun) (replay.Tape, error) {
 				return journaled.NewTape(journal), nil
 			},
@@ -355,7 +498,7 @@ func TestForceStopCanRecoverThroughRecreatedSessionAndJournal(t *testing.T) {
 
 	run := integrationRun{id: "recover"}
 	request := capcompute.PlayRequest[string, integrationRun]{
-		Input:      json.RawMessage(`{"message":"read the configured page"}`),
+		Input:      mustAgentInput(t, "read the configured page"),
 		Entrypoint: "run",
 		UserData:   run,
 	}
@@ -497,7 +640,7 @@ func TestHostYieldKeepsAuroraSessionReplayable(t *testing.T) {
 
 	run := integrationRun{id: "yield"}
 	session, err := compute.CreateSession(ctx, capcompute.PlayRequest[string, integrationRun]{
-		Input:      json.RawMessage(`{"message":"read the configured page"}`),
+		Input:      mustAgentInput(t, "read the configured page"),
 		Entrypoint: "run",
 		UserData:   run,
 	})
@@ -533,6 +676,18 @@ func TestHostYieldKeepsAuroraSessionReplayable(t *testing.T) {
 		t.Fatalf("output does not contain resumed content: %s", result.Output)
 	}
 	assertRecordedCalls(t, journal, []string{"llm.chat", "internet.read", "llm.chat"})
+}
+
+func mustAgentInput(t *testing.T, message string) json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal(map[string]any{
+		"message":      message,
+		"capabilities": []dispatcher.Capability{integrationInternetCapability},
+	})
+	if err != nil {
+		t.Fatalf("marshal agent input: %v", err)
+	}
+	return raw
 }
 
 func buildGuest(t *testing.T) string {

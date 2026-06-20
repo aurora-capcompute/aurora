@@ -46,8 +46,15 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /v1/runs/{runID}/retry", s.retryRun)
 }
 
-func (s *Server) createThread(w http.ResponseWriter, _ *http.Request) {
-	thread, err := s.runtime.CreateThread()
+func (s *Server) createThread(w http.ResponseWriter, request *http.Request) {
+	var body struct {
+		Manifest agent.Manifest `json:"manifest"`
+	}
+	if err := decodeJSON(request, &body); err != nil {
+		writeError(w, err)
+		return
+	}
+	thread, err := s.runtime.CreateThread(body.Manifest)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -70,13 +77,14 @@ func (s *Server) getThread(w http.ResponseWriter, request *http.Request) {
 
 func (s *Server) createRun(w http.ResponseWriter, request *http.Request) {
 	var body struct {
-		Content string `json:"content"`
+		Content             string                   `json:"content"`
+		CapabilityOverrides []agent.CapabilityConfig `json:"capability_overrides,omitempty"`
 	}
 	if err := decodeJSON(request, &body); err != nil {
 		writeError(w, err)
 		return
 	}
-	run, err := s.runtime.CreateRun(request.PathValue("threadID"), strings.TrimSpace(body.Content))
+	run, err := s.runtime.CreateRun(request.PathValue("threadID"), strings.TrimSpace(body.Content), body.CapabilityOverrides)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -113,13 +121,14 @@ func (s *Server) stopRun(w http.ResponseWriter, request *http.Request) {
 
 func (s *Server) retryRun(w http.ResponseWriter, request *http.Request) {
 	var body struct {
-		Mode agent.RetryMode `json:"mode"`
+		Mode                agent.RetryMode          `json:"mode"`
+		CapabilityOverrides []agent.CapabilityConfig `json:"capability_overrides,omitempty"`
 	}
 	if err := decodeJSON(request, &body); err != nil {
 		writeError(w, err)
 		return
 	}
-	run, err := s.runtime.Retry(request.PathValue("runID"), body.Mode)
+	run, err := s.runtime.Retry(request.PathValue("runID"), body.Mode, body.CapabilityOverrides)
 	if err != nil {
 		writeError(w, err)
 		return
