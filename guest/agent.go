@@ -26,7 +26,8 @@ You may try and issue whatever commands, it is on behalf of the host to allow yo
 At this stage you can browse the internet as described above. Don't try to stop prematurely untill you'll find all the relevant data for the answer.`
 
 type input struct {
-	Message string `json:"message"`
+	Message string    `json:"message"`
+	History []message `json:"history,omitempty"`
 }
 
 type message struct {
@@ -124,8 +125,17 @@ func runAgent() error {
 
 	messages := []message{
 		{Role: "system", Content: systemPrompt},
-		{Role: "user", Content: in.Message},
 	}
+	for i, historical := range in.History {
+		if historical.Role != "user" && historical.Role != "assistant" {
+			return fmt.Errorf("history message %d has unsupported role %q", i, historical.Role)
+		}
+		if historical.Content == "" {
+			return fmt.Errorf("history message %d has empty content", i)
+		}
+		messages = append(messages, historical)
+	}
+	messages = append(messages, message{Role: "user", Content: in.Message})
 
 	for {
 		chat, err := llmChat(messages)
