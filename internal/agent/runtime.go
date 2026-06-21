@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -1177,8 +1178,10 @@ func (r *Runtime) restore(ctx context.Context) error {
 			return err
 		}
 		if stored.BrainDigest != "" && stored.BrainDigest != brain.Digest {
-			return fmt.Errorf("brain %q digest changed: stored %s current %s",
-				brain.ID, stored.BrainDigest, brain.Digest)
+			slog.Info("skipping run with outdated brain digest",
+				"run_id", stored.ID, "brain", brain.ID,
+				"stored_digest", stored.BrainDigest, "current_digest", brain.Digest)
+			continue
 		}
 		status := stored.Status
 		if status == RunQueued || status == RunRunning || status == RunStopping {
@@ -1216,6 +1219,13 @@ func (r *Runtime) restore(ctx context.Context) error {
 			if err := r.stateStore.SaveRun(ctx, r.storedRunLocked(run)); err != nil {
 				return err
 			}
+		}
+	}
+	for _, thread := range r.threads {
+		if thread.activeRunID != "" && r.runs[thread.activeRunID] == nil {
+			slog.Info("clearing active run from thread due to brain digest mismatch",
+				"thread_id", thread.id, "run_id", thread.activeRunID)
+			thread.activeRunID = ""
 		}
 	}
 	return nil
