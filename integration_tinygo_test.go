@@ -182,6 +182,14 @@ func TestTinyGoGuestThroughCapcomputeWithFakeLLM(t *testing.T) {
 	ctx := context.Background()
 	wasmPath := buildGuest(t)
 	journal := memory.NewJournal()
+	dispatcherFactory := internalhost.Factory[integrationRun]{
+		LLM:          llm.NewFakeClient(server.URL),
+		Internet:     internet.NewClient(policy),
+		Capabilities: []dispatcher.Capability{integrationInternetCapability},
+		NewTape: func(context.Context, integrationRun) (replay.Tape, error) {
+			return journaled.NewTape(journal), nil
+		},
+	}
 	store := memory.NewSessionStore[string, integrationRun]()
 	compute, err := capcompute.NewComputeCompiledPlugin[string, integrationRun](ctx, capcompute.Config[string, integrationRun]{
 		Manifest: extism.Manifest{
@@ -189,14 +197,6 @@ func TestTinyGoGuestThroughCapcomputeWithFakeLLM(t *testing.T) {
 		},
 		PluginConfig: extism.PluginConfig{
 			EnableWasi: true,
-		},
-		Dispatchers: internalhost.Factory[integrationRun]{
-			LLM:          llm.NewFakeClient(server.URL),
-			Internet:     internet.NewClient(policy),
-			Capabilities: []dispatcher.Capability{integrationInternetCapability},
-			NewTape: func(context.Context, integrationRun) (replay.Tape, error) {
-				return journaled.NewTape(journal), nil
-			},
 		},
 		SessionStore: store,
 	})
@@ -220,10 +220,15 @@ func TestTinyGoGuestThroughCapcomputeWithFakeLLM(t *testing.T) {
 		t.Fatalf("encode input: %v", err)
 	}
 	run := integrationRun{id: "integration"}
+	d, err := dispatcherFactory.NewDispatcher(ctx, run)
+	if err != nil {
+		t.Fatalf("create dispatcher: %v", err)
+	}
 	session, err := compute.CreateSession(ctx, capcompute.PlayRequest[string, integrationRun]{
 		Input:      input,
 		Entrypoint: "run",
 		UserData:   run,
+		Dispatcher: d,
 	})
 	if err != nil {
 		t.Fatalf("create session: %v", err)
@@ -279,6 +284,14 @@ func TestTinyGoGuestExecutesAndAggregatesActionBatch(t *testing.T) {
 	ctx := context.Background()
 	journal := memory.NewJournal()
 	model := &batchLLM{urls: []string{server.URL + "/first", server.URL + "/second"}}
+	batchFactory := internalhost.Factory[integrationRun]{
+		LLM:          model,
+		Internet:     internet.NewClient(policy),
+		Capabilities: []dispatcher.Capability{integrationInternetCapability},
+		NewTape: func(context.Context, integrationRun) (replay.Tape, error) {
+			return journaled.NewTape(journal), nil
+		},
+	}
 	store := memory.NewSessionStore[string, integrationRun]()
 	compute, err := capcompute.NewComputeCompiledPlugin[string, integrationRun](ctx, capcompute.Config[string, integrationRun]{
 		Manifest: extism.Manifest{
@@ -286,14 +299,6 @@ func TestTinyGoGuestExecutesAndAggregatesActionBatch(t *testing.T) {
 		},
 		PluginConfig: extism.PluginConfig{
 			EnableWasi: true,
-		},
-		Dispatchers: internalhost.Factory[integrationRun]{
-			LLM:          model,
-			Internet:     internet.NewClient(policy),
-			Capabilities: []dispatcher.Capability{integrationInternetCapability},
-			NewTape: func(context.Context, integrationRun) (replay.Tape, error) {
-				return journaled.NewTape(journal), nil
-			},
 		},
 		SessionStore: store,
 	})
@@ -307,10 +312,15 @@ func TestTinyGoGuestExecutesAndAggregatesActionBatch(t *testing.T) {
 	})
 
 	run := integrationRun{id: "batch"}
+	d, err := batchFactory.NewDispatcher(ctx, run)
+	if err != nil {
+		t.Fatalf("create dispatcher: %v", err)
+	}
 	session, err := compute.CreateSession(ctx, capcompute.PlayRequest[string, integrationRun]{
 		Input:      mustAgentInput(t, "combine both sources"),
 		Entrypoint: "run",
 		UserData:   run,
+		Dispatcher: d,
 	})
 	if err != nil {
 		t.Fatalf("create session: %v", err)
@@ -349,20 +359,20 @@ func TestTinyGoGuestReturnsCapabilityFailureToModel(t *testing.T) {
 	ctx := context.Background()
 	journal := memory.NewJournal()
 	model := &failureAwareLLM{}
+	failFactory := internalhost.Factory[integrationRun]{
+		LLM:          model,
+		Internet:     partiallyFailingReader{},
+		Capabilities: []dispatcher.Capability{integrationInternetCapability},
+		NewTape: func(context.Context, integrationRun) (replay.Tape, error) {
+			return journaled.NewTape(journal), nil
+		},
+	}
 	store := memory.NewSessionStore[string, integrationRun]()
 	compute, err := capcompute.NewComputeCompiledPlugin[string, integrationRun](ctx, capcompute.Config[string, integrationRun]{
 		Manifest: extism.Manifest{
 			Wasm: []extism.Wasm{extism.WasmFile{Path: buildGuest(t)}},
 		},
 		PluginConfig: extism.PluginConfig{EnableWasi: true},
-		Dispatchers: internalhost.Factory[integrationRun]{
-			LLM:          model,
-			Internet:     partiallyFailingReader{},
-			Capabilities: []dispatcher.Capability{integrationInternetCapability},
-			NewTape: func(context.Context, integrationRun) (replay.Tape, error) {
-				return journaled.NewTape(journal), nil
-			},
-		},
 		SessionStore: store,
 	})
 	if err != nil {
@@ -375,10 +385,15 @@ func TestTinyGoGuestReturnsCapabilityFailureToModel(t *testing.T) {
 	})
 
 	run := integrationRun{id: "capability-failure"}
+	d, err := failFactory.NewDispatcher(ctx, run)
+	if err != nil {
+		t.Fatalf("create dispatcher: %v", err)
+	}
 	session, err := compute.CreateSession(ctx, capcompute.PlayRequest[string, integrationRun]{
 		Input:      mustAgentInput(t, "research with both sources"),
 		Entrypoint: "run",
 		UserData:   run,
+		Dispatcher: d,
 	})
 	if err != nil {
 		t.Fatalf("create session: %v", err)
@@ -468,6 +483,14 @@ func TestForceStopCanRecoverThroughRecreatedSessionAndJournal(t *testing.T) {
 	journal := memory.NewJournal()
 	reader := &interruptibleReader{started: make(chan struct{})}
 	model := &countingLLM{next: llm.NewFakeClient("https://example.com")}
+	recoverFactory := internalhost.Factory[integrationRun]{
+		LLM:          model,
+		Internet:     reader,
+		Capabilities: []dispatcher.Capability{integrationInternetCapability},
+		NewTape: func(context.Context, integrationRun) (replay.Tape, error) {
+			return journaled.NewTape(journal), nil
+		},
+	}
 	store := memory.NewSessionStore[string, integrationRun]()
 	compute, err := capcompute.NewComputeCompiledPlugin[string, integrationRun](ctx, capcompute.Config[string, integrationRun]{
 		Manifest: extism.Manifest{
@@ -475,14 +498,6 @@ func TestForceStopCanRecoverThroughRecreatedSessionAndJournal(t *testing.T) {
 		},
 		PluginConfig: extism.PluginConfig{
 			EnableWasi: true,
-		},
-		Dispatchers: internalhost.Factory[integrationRun]{
-			LLM:          model,
-			Internet:     reader,
-			Capabilities: []dispatcher.Capability{integrationInternetCapability},
-			NewTape: func(context.Context, integrationRun) (replay.Tape, error) {
-				return journaled.NewTape(journal), nil
-			},
 		},
 		SessionStore: store,
 	})
@@ -496,10 +511,15 @@ func TestForceStopCanRecoverThroughRecreatedSessionAndJournal(t *testing.T) {
 	})
 
 	run := integrationRun{id: "recover"}
+	d1, err := recoverFactory.NewDispatcher(ctx, run)
+	if err != nil {
+		t.Fatalf("create dispatcher: %v", err)
+	}
 	request := capcompute.PlayRequest[string, integrationRun]{
 		Input:      mustAgentInput(t, "read the configured page"),
 		Entrypoint: "run",
 		UserData:   run,
+		Dispatcher: d1,
 	}
 	stoppedSession, err := compute.CreateSession(ctx, request)
 	if err != nil {
@@ -529,6 +549,11 @@ func TestForceStopCanRecoverThroughRecreatedSessionAndJournal(t *testing.T) {
 		t.Fatalf("stopped result = %+v", result)
 	}
 
+	d2, err := recoverFactory.NewDispatcher(ctx, run)
+	if err != nil {
+		t.Fatalf("create recovery dispatcher: %v", err)
+	}
+	request.Dispatcher = d2
 	recreated, err := compute.CreateSession(ctx, request)
 	if err != nil {
 		t.Fatalf("recreate session: %v", err)
@@ -569,7 +594,7 @@ type yieldOnceFactory struct {
 	internet internalhost.InternetReader
 }
 
-func (f *yieldOnceFactory) NewDispatcher(context.Context, integrationRun) (dispatcher.Dispatcher[integrationRun], error) {
+func (f *yieldOnceFactory) newDispatcher() dispatcher.Dispatcher[integrationRun] {
 	next := &yieldOnceDispatcher{
 		yielded: &f.yielded,
 		next: &internalhost.Dispatcher[integrationRun]{
@@ -579,7 +604,7 @@ func (f *yieldOnceFactory) NewDispatcher(context.Context, integrationRun) (dispa
 			},
 		},
 	}
-	return replay.NewDispatcher[integrationRun](journaled.NewTape(f.journal), next), nil
+	return replay.NewDispatcher[integrationRun](journaled.NewTape(f.journal), next)
 }
 
 type yieldOnceDispatcher struct {
@@ -627,7 +652,6 @@ func TestHostYieldKeepsAuroraSessionReplayable(t *testing.T) {
 		PluginConfig: extism.PluginConfig{
 			EnableWasi: true,
 		},
-		Dispatchers:  factory,
 		SessionStore: store,
 	})
 	if err != nil {
@@ -644,6 +668,7 @@ func TestHostYieldKeepsAuroraSessionReplayable(t *testing.T) {
 		Input:      mustAgentInput(t, "read the configured page"),
 		Entrypoint: "run",
 		UserData:   run,
+		Dispatcher: factory.newDispatcher(),
 	})
 	if err != nil {
 		t.Fatalf("create session: %v", err)

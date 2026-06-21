@@ -77,26 +77,27 @@ type Config struct {
 }
 
 type Runtime struct {
-	mu           sync.Mutex
-	computes     map[string]*capcompute.ComputeCompiledPlugin[string, RunKey]
-	brains       *BrainRegistry
-	sessionStore capcompute.SessionStore[string, RunKey]
-	persistence  Store
-	tenantID     string
-	threads      map[string]*threadState
-	runs         map[string]*runState
-	subscribers  map[string]map[uint64]chan Event
-	nextSubID    uint64
-	idSource     func(string) (string, error)
-	now          func() time.Time
-	eventSize    int
-	taskSecret   []byte
-	taskTTL      time.Duration
-	instanceID   string
-	leaseTTL     time.Duration
-	dispatchers  *dispatcherregistry.Registry
-	wg           sync.WaitGroup
-	closed       bool
+	mu                sync.Mutex
+	computes          map[string]*capcompute.ComputeCompiledPlugin[string, RunKey]
+	brains            *BrainRegistry
+	sessionStore      capcompute.SessionStore[string, RunKey]
+	persistence       Store
+	tenantID          string
+	threads           map[string]*threadState
+	runs              map[string]*runState
+	subscribers       map[string]map[uint64]chan Event
+	nextSubID         uint64
+	idSource          func(string) (string, error)
+	now               func() time.Time
+	eventSize         int
+	taskSecret        []byte
+	taskTTL           time.Duration
+	instanceID        string
+	leaseTTL          time.Duration
+	dispatchers       *dispatcherregistry.Registry
+	dispatcherFactory internalhost.Factory[RunKey]
+	wg                sync.WaitGroup
+	closed            bool
 }
 
 type threadState struct {
@@ -325,13 +326,13 @@ func NewRuntime(ctx context.Context, config Config) (*Runtime, error) {
 			})
 		},
 	}
+	runtime.dispatcherFactory = dispatcherFactory
 	for _, artifact := range brains.List() {
 		compute, err := capcompute.NewComputeCompiledPlugin[string, RunKey](ctx, capcompute.Config[string, RunKey]{
 			Manifest: extism.Manifest{
 				Wasm: []extism.Wasm{extism.WasmFile{Path: artifact.Path}},
 			},
 			PluginConfig: extism.PluginConfig{EnableWasi: true},
-			Dispatchers:  dispatcherFactory,
 			SessionStore: runtime.sessionStore,
 		})
 		if err != nil {
@@ -841,9 +842,16 @@ func (r *Runtime) execute(runID string) {
 		if session != nil {
 			_ = session.Close(context.Background())
 		}
+		runCtx := r.runContext(run)
+		sessionDispatcher, err := r.dispatcherFactory.NewDispatcher(context.Background(), runCtx)
+		if err != nil {
+			r.finish(runID, RunFailed, "", err)
+			return
+		}
 		session, err = compute.CreateSession(context.Background(), capcompute.PlayRequest[string, RunKey]{
 			Entrypoint: "run",
-			UserData:   r.runContext(run),
+			UserData:   runCtx,
+			Dispatcher: sessionDispatcher,
 		})
 		if err == nil {
 			var input []byte

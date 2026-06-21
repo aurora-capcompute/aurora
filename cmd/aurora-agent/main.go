@@ -87,21 +87,21 @@ func execute(ctx context.Context, args []string) (executeResult, error) {
 	wasmPath := envDefault("AURORA_GUEST_WASM", "../aurora-brains/agent/agent.wasm")
 	journal := memory.NewJournal()
 	store := memory.NewSessionStore[string, Run]()
+	dispatcherFactory := internalhost.Factory[Run]{
+		LLM:                     hostConfig.LLM,
+		Internet:                hostConfig.Internet,
+		InternetRequireApproval: hostConfig.InternetRequireApproval,
+		Capabilities:            hostConfig.Capabilities,
+		NewTape: func(context.Context, Run) (replay.Tape, error) {
+			return journaled.NewTape(journal), nil
+		},
+	}
 	compute, err := capcompute.NewComputeCompiledPlugin[string, Run](ctx, capcompute.Config[string, Run]{
 		Manifest: extism.Manifest{
 			Wasm: []extism.Wasm{extism.WasmFile{Path: wasmPath}},
 		},
 		PluginConfig: extism.PluginConfig{
 			EnableWasi: true,
-		},
-		Dispatchers: internalhost.Factory[Run]{
-			LLM:                     hostConfig.LLM,
-			Internet:                hostConfig.Internet,
-			InternetRequireApproval: hostConfig.InternetRequireApproval,
-			Capabilities:            hostConfig.Capabilities,
-			NewTape: func(context.Context, Run) (replay.Tape, error) {
-				return journaled.NewTape(journal), nil
-			},
 		},
 		SessionStore: store,
 	})
@@ -111,9 +111,14 @@ func execute(ctx context.Context, args []string) (executeResult, error) {
 	defer compute.CloseCompiled(context.Background())
 
 	run := Run{ID: envDefault("AURORA_RUN_ID", fmt.Sprintf("run-%d", time.Now().UnixNano()))}
+	sessionDispatcher, err := dispatcherFactory.NewDispatcher(ctx, run)
+	if err != nil {
+		return executeResult{}, fmt.Errorf("create dispatcher: %w", err)
+	}
 	session, err := compute.CreateSession(ctx, capcompute.PlayRequest[string, Run]{
 		Entrypoint: "run",
 		UserData:   run,
+		Dispatcher: sessionDispatcher,
 	})
 	if err != nil {
 		return executeResult{}, fmt.Errorf("create session: %w", err)
