@@ -18,7 +18,6 @@ type delegationRouter struct {
 type delegationChild struct {
 	manifest ChildManifest
 	runtime  *Runtime
-	depth    int
 }
 
 type delegateArgs struct {
@@ -30,13 +29,12 @@ type delegateResult struct {
 	Answer string `json:"answer"`
 }
 
-func newDelegationRouter(next dispatcher.Dispatcher[RunContext], children []ChildManifest, runtime *Runtime, depth int) *delegationRouter {
+func newDelegationRouter(next dispatcher.Dispatcher[RunContext], children []ChildManifest, runtime *Runtime) *delegationRouter {
 	m := make(map[string]delegationChild, len(children))
 	for _, child := range children {
 		m[child.Name] = delegationChild{
 			manifest: child,
 			runtime:  runtime,
-			depth:    depth,
 		}
 	}
 	return &delegationRouter{next: next, children: m}
@@ -62,15 +60,7 @@ func (r *delegationRouter) Capabilities() []dispatcher.Capability {
 }
 
 func (c *delegationChild) dispatch(ctx context.Context, call dispatcher.Call) (dispatcher.Outcome, error) {
-	slog.Info("delegation: dispatch started", "child", c.manifest.Name, "depth", c.depth)
-	maxDepth := c.manifest.MaxDepth
-	if maxDepth == 0 {
-		maxDepth = 1
-	}
-	if c.depth >= maxDepth {
-		slog.Warn("delegation: max depth reached", "child", c.manifest.Name, "depth", c.depth, "max", maxDepth)
-		return dispatcher.Failed("max delegation depth reached"), nil
-	}
+	slog.Info("delegation: dispatch started", "child", c.manifest.Name)
 
 	var args delegateArgs
 	if err := json.Unmarshal(call.Args, &args); err != nil {
@@ -88,7 +78,7 @@ func (c *delegationChild) dispatch(ctx context.Context, call dispatcher.Call) (d
 	}
 	slog.Info("delegation: thread created", "child", c.manifest.Name, "thread_id", thread.ID)
 
-	run, err := c.runtime.createChildRun(thread.ID, args.Message, c.depth+1)
+	run, err := c.runtime.createChildRun(thread.ID, args.Message)
 	if err != nil {
 		slog.Error("delegation: create run failed", "child", c.manifest.Name, "error", err)
 		return dispatcher.Failed(fmt.Sprintf("create child run: %v", err)), nil
@@ -172,7 +162,7 @@ func delegationCapability(name string, child ChildManifest) dispatcher.Capabilit
 	}
 }
 
-func (r *Runtime) createChildRun(threadID string, message string, depth int) (RunSnapshot, error) {
+func (r *Runtime) createChildRun(threadID string, message string) (RunSnapshot, error) {
 	if message == "" {
 		return RunSnapshot{}, fmt.Errorf("%w: message is required", ErrInvalid)
 	}
@@ -213,7 +203,6 @@ func (r *Runtime) createChildRun(threadID string, message string, depth int) (Ru
 		history:           append([]HistoryMessage(nil), thread.history...),
 		status:            RunQueued,
 		attempt:           1,
-		depth:             depth,
 		createdAt:         now,
 		updatedAt:         now,
 		effectiveManifest: effectiveManifest,

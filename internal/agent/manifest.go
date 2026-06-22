@@ -28,7 +28,6 @@ type ChildManifest struct {
 	SystemPrompt string             `json:"system_prompt,omitempty"`
 	Capabilities []CapabilityConfig `json:"capabilities"`
 	Children     []ChildManifest    `json:"children,omitempty"`
-	MaxDepth     int                `json:"max_depth,omitempty"`
 }
 
 type CapabilityConfig struct {
@@ -134,9 +133,6 @@ func validateChildren(children []ChildManifest, provider DispatcherProvider) err
 				return fmt.Errorf("%w: child %q capability %q requires approval; child capabilities cannot require approval — set require_approval: false explicitly", ErrInvalid, child.Name, cap.Name)
 			}
 			child.Capabilities[j].Settings = append(json.RawMessage(nil), normalized...)
-		}
-		if child.MaxDepth < 0 {
-			return fmt.Errorf("%w: child %q max_depth must not be negative", ErrInvalid, child.Brain)
 		}
 		if err := validateChildren(child.Children, provider); err != nil {
 			return fmt.Errorf("child %q: %w", child.Brain, err)
