@@ -359,7 +359,10 @@ func TestRuntimePassesEffectiveManifestToDispatcherProvider(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load journal: %v", err)
 	}
-	if len(journal) != 1 || journal[0].Call.Name != "openai.chat" {
+	if len(journal) != 3 ||
+		journal[0].Call.Name != callAgentInput ||
+		journal[1].Call.Name != "openai.chat" ||
+		journal[2].Call.Name != callAgentFinish {
 		t.Fatalf("journal = %+v", journal)
 	}
 

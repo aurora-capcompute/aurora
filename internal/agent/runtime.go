@@ -211,11 +211,11 @@ type Event struct {
 }
 
 type JournalEvent struct {
-	RunID         string                `json:"run_id"`
-	Index         int                   `json:"index"`
-	Call          string                `json:"call"`
+	RunID         string                 `json:"run_id"`
+	Index         int                    `json:"index"`
+	Call          string                 `json:"call"`
 	OutcomeStatus dispatcher.OutcomeKind `json:"outcome_status"`
-	OutcomeSize   int                   `json:"outcome_size"`
+	OutcomeSize   int                    `json:"outcome_size"`
 }
 
 func NewRuntime(ctx context.Context, config Config) (*Runtime, error) {
@@ -291,8 +291,12 @@ func NewRuntime(ctx context.Context, config Config) (*Runtime, error) {
 			runtime.mu.Lock()
 			run := runtime.runs[key.RunID]
 			var manifest Manifest
+			var message string
+			var history []HistoryMessage
 			if run != nil {
 				manifest = cloneManifest(run.effectiveManifest)
+				message = run.message
+				history = append([]HistoryMessage(nil), run.history...)
 			}
 			runtime.mu.Unlock()
 			if run == nil {
@@ -309,7 +313,9 @@ func NewRuntime(ctx context.Context, config Config) (*Runtime, error) {
 			if len(manifest.Children) > 0 {
 				d = newDelegationRouter(d, manifest.Children, runtime)
 			}
-			return d, nil
+			// Wrap with the lifecycle dispatcher so agent.input/agent.finish are
+			// recorded on the replay journal alongside capability calls.
+			return newLifecycleDispatcher(d, message, history, manifest), nil
 		},
 		NewJournal: func(_ context.Context, key RunKey) (journaled.Journal, error) {
 			runtime.mu.Lock()
@@ -872,18 +878,8 @@ func (r *Runtime) execute(runID string) {
 			UserData:   runCtx,
 			Dispatcher: sessionDispatcher,
 		})
-		if err == nil {
-			var input []byte
-			input, err = json.Marshal(agentInput{
-				Message:      run.message,
-				History:      run.history,
-				SystemPrompt: run.effectiveManifest.SystemPrompt,
-				Capabilities: visibleCapabilities(session.Capabilities(), run.effectiveManifest),
-			})
-			if err == nil {
-				session.Input = input
-			}
-		}
+		// The guest fetches its input via the agent.input host call (served by the
+		// lifecycle dispatcher), so no entrypoint input is supplied here.
 		if err == nil {
 			err = r.sessionStore.SaveSession(context.Background(), session.GuestData.SessionKey(), session)
 		}
@@ -935,16 +931,12 @@ func (r *Runtime) execute(runID string) {
 	slog.Info("execute: play finished", "run_id", runID, "status", result.Status, "err", result.Err)
 	switch result.Status {
 	case capcompute.PlayCompleted:
-		var output agentOutput
-		if err := json.Unmarshal(result.Output, &output); err != nil {
-			r.finish(runID, RunFailed, "", fmt.Errorf("decode agent output: %w", err))
+		answer, err := r.answerFromJournal(runID)
+		if err != nil {
+			r.finish(runID, RunFailed, "", err)
 			return
 		}
-		if output.Answer == "" {
-			r.finish(runID, RunFailed, "", errors.New("agent output missing answer"))
-			return
-		}
-		r.finish(runID, RunCompleted, output.Answer, nil)
+		r.finish(runID, RunCompleted, answer, nil)
 	case capcompute.PlayYielded:
 		tasks, taskErr := r.taskStore.List(context.Background(), r.tenantID, runID)
 		if taskErr == nil && hasPendingTask(tasks) {
