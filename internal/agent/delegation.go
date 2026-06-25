@@ -59,6 +59,17 @@ func (r *delegationRouter) Capabilities() []dispatcher.Capability {
 	return caps
 }
 
+// onChildFailure applies the child's failure-mode policy. OnFailurePropagate
+// forces the parent run to fail (a dispatcher error alone only surfaces a
+// recoverable observation to the brain); otherwise the failure is reported to
+// the parent brain as a recoverable failed observation.
+func (c *delegationChild) onChildFailure(parentRunID string, err error) (dispatcher.Outcome, error) {
+	if c.manifest.OnFailure == OnFailurePropagate {
+		c.runtime.requestRunFailure(parentRunID, fmt.Errorf("child %q failed: %w", c.manifest.Name, err))
+	}
+	return dispatcher.Failed(err.Error()), nil
+}
+
 func (c *delegationChild) dispatch(ctx context.Context, parent RunContext, call dispatcher.Call) (dispatcher.Outcome, error) {
 	slog.Info("delegation: dispatch started", "child", c.manifest.Name)
 
@@ -79,7 +90,7 @@ func (c *delegationChild) dispatch(ctx context.Context, parent RunContext, call 
 		}
 		answer, err := c.runtime.waitForCompletion(ctx, childID, threadID)
 		if err != nil {
-			return dispatcher.Failed(err.Error()), nil
+			return c.onChildFailure(parent.RunID, err)
 		}
 		result, marshalErr := json.Marshal(delegateResult{Answer: answer})
 		if marshalErr != nil {
@@ -109,7 +120,7 @@ func (c *delegationChild) dispatch(ctx context.Context, parent RunContext, call 
 	answer, err := c.runtime.waitForCompletion(ctx, run.ID, thread.ID)
 	if err != nil {
 		slog.Error("delegation: wait failed", "child", c.manifest.Name, "run_id", run.ID, "error", err)
-		return dispatcher.Failed(err.Error()), nil
+		return c.onChildFailure(parent.RunID, err)
 	}
 	slog.Info("delegation: completed", "child", c.manifest.Name, "answer_len", len(answer))
 

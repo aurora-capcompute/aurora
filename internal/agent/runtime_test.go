@@ -613,6 +613,19 @@ func TestRuntimeCascadeResumeReusesChildRun(t *testing.T) {
 		t.Fatalf("child.parentRunID = %q, want %q", childParent, run.ID)
 	}
 
+	// Call-graph projection: the parent run projects to a tree with the child
+	// beneath it, linked back to the parent.
+	graph, err := runtime.CallGraph(run.ID)
+	if err != nil {
+		t.Fatalf("call graph: %v", err)
+	}
+	if graph.RunID != run.ID || len(graph.Children) != 1 || graph.Children[0].RunID != childID {
+		t.Fatalf("call graph = %+v, want root %s with single child %s", graph, run.ID, childID)
+	}
+	if graph.Children[0].ParentID != run.ID {
+		t.Fatalf("child node ParentID = %q, want %q", graph.Children[0].ParentID, run.ID)
+	}
+
 	// Deep cascade resume: restarting the parent must reuse and retry the same
 	// child run rather than spawning a fresh one.
 	if _, err := runtime.Retry(run.ID, RetryRestart, nil); err != nil {
@@ -626,5 +639,97 @@ func TestRuntimeCascadeResumeReusesChildRun(t *testing.T) {
 	}
 	if _, attempt := runField(t, runtime, childID); attempt <= childAttempt {
 		t.Fatalf("child attempt = %d, want > %d (child should have been retried)", attempt, childAttempt)
+	}
+}
+
+// failingChildDispatchers makes a parent delegate once to a child whose brain
+// then requests an unavailable capability, failing the child run.
+type failingChildDispatchers struct{}
+
+func (failingChildDispatchers) Normalize(_ string, settings json.RawMessage) (json.RawMessage, error) {
+	if len(settings) == 0 {
+		return json.RawMessage(`{}`), nil
+	}
+	return append(json.RawMessage(nil), settings...), nil
+}
+
+func (failingChildDispatchers) NewDispatcher(_ context.Context, _ RunContext, _ Manifest) (dispatcher.Dispatcher[RunContext], error) {
+	return failingChildDispatcher{}, nil
+}
+
+func (failingChildDispatchers) IsSubset(_ string, _, _ json.RawMessage) error { return nil }
+
+type failingChildDispatcher struct{}
+
+func (failingChildDispatcher) Dispatch(_ context.Context, _ RunContext, call dispatcher.Call) (dispatcher.Outcome, error) {
+	if call.Name != "openai.chat" {
+		return dispatcher.Failed("unsupported call: " + call.Name), nil
+	}
+	var req struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	_ = json.Unmarshal(call.Args, &req)
+	for _, m := range req.Messages {
+		if m.Role == "user" && strings.Contains(m.Content, "do subtask") {
+			// The child requests a capability it was not granted; the brain
+			// rejects it and the child run fails.
+			return chatActions(`{"actions":[{"action":"missing.tool","content":{}}]}`), nil
+		}
+	}
+	return chatActions(`{"actions":[{"action":"call.child","content":{"message":"do subtask"}}]}`), nil
+}
+
+func TestRuntimeChildFailurePropagatesToParent(t *testing.T) {
+	if _, err := exec.LookPath("tinygo"); err != nil {
+		t.Skip("tinygo not found")
+	}
+	store := newRuntimeStore()
+	runtime, err := NewRuntime(context.Background(), Config{
+		Brains: staticBrains{
+			defaultID: "brain@1",
+			sources:   []BrainSource{{ID: "brain@1", Wasm: buildBrain(t)}},
+		},
+		Dispatchers:  failingChildDispatchers{},
+		StateStore:   store,
+		TaskStore:    store,
+		SessionStore: newRuntimeSessions(),
+		TaskSecret:   []byte("stable-secret"),
+		IDSource:     sequentialIDs(),
+	})
+	if err != nil {
+		t.Fatalf("new runtime: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := runtime.Close(ctx); err != nil {
+			t.Errorf("close runtime: %v", err)
+		}
+	})
+
+	thread, err := runtime.CreateThread(Manifest{
+		Version: ManifestVersion,
+		Brain:   "brain@1",
+		Children: []ChildManifest{{
+			Name: "child", Brain: "brain@1", Capabilities: []CapabilityConfig{},
+			OnFailure: OnFailurePropagate,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("create thread: %v", err)
+	}
+	run, err := runtime.CreateRun(thread.ID, "parent task", nil)
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	// With OnFailurePropagate, the failed child fails the parent run rather than
+	// surfacing as a recoverable observation.
+	failed := waitForStatus(t, runtime, run.ID, RunFailed)
+	if !strings.Contains(failed.Error, "child") {
+		t.Fatalf("parent error = %q, want it to mention the failed child", failed.Error)
 	}
 }

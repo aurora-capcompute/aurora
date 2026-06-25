@@ -139,6 +139,9 @@ type runState struct {
 	// spawn order rather than spawning fresh ones.
 	cascade       bool
 	cascadeCursor int
+	// failure forces the run to finish as failed regardless of how its play ends;
+	// set when a delegated child fails under an OnFailurePropagate policy.
+	failure error
 }
 
 type agentInput struct {
@@ -738,6 +741,7 @@ func (r *Runtime) Retry(runID string, mode RetryMode, overrides []CapabilityConf
 	run.attempt++
 	run.answer = ""
 	run.err = ""
+	run.failure = nil
 	run.stopRequested = false
 	run.startedAt = nil
 	run.completedAt = nil
@@ -955,6 +959,13 @@ func (r *Runtime) execute(runID string) {
 
 	result := <-handle.Results()
 	slog.Info("execute: play finished", "run_id", runID, "status", result.Status, "err", result.Err)
+	r.mu.Lock()
+	forced := r.runs[runID].failure
+	r.mu.Unlock()
+	if forced != nil {
+		r.finish(runID, RunFailed, "", forced)
+		return
+	}
 	switch result.Status {
 	case capcompute.PlayCompleted:
 		answer, err := r.answerFromJournal(runID)
@@ -981,6 +992,24 @@ func (r *Runtime) execute(runID string) {
 		}
 	default:
 		r.finish(runID, RunFailed, "", result.Err)
+	}
+}
+
+// requestRunFailure marks a run to finish as failed and stops its in-flight play.
+// It is used to propagate a delegated child's failure up to its parent run when
+// the child's failure-mode policy is OnFailurePropagate.
+func (r *Runtime) requestRunFailure(runID string, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	run := r.runs[runID]
+	if run == nil {
+		return
+	}
+	if run.failure == nil {
+		run.failure = err
+	}
+	if run.handle != nil {
+		run.handle.Stop()
 	}
 }
 

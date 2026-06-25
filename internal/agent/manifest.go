@@ -28,7 +28,17 @@ type ChildManifest struct {
 	SystemPrompt string             `json:"system_prompt,omitempty"`
 	Capabilities []CapabilityConfig `json:"capabilities"`
 	Children     []ChildManifest    `json:"children,omitempty"`
+	// OnFailure selects how a failure of this delegated child is handled:
+	// OnFailureReport (default) surfaces it to the parent brain as a recoverable
+	// failed observation; OnFailurePropagate fails the parent run outright.
+	OnFailure string `json:"on_failure,omitempty"`
 }
+
+// Child failure-handling modes for ChildManifest.OnFailure.
+const (
+	OnFailureReport    = "report"
+	OnFailurePropagate = "propagate"
+)
 
 type CapabilityConfig struct {
 	Name     string          `json:"name"`
@@ -120,6 +130,11 @@ func validateChildren(children []ChildManifest, provider DispatcherProvider) err
 			return fmt.Errorf("%w: duplicate child name %q", ErrInvalid, child.Name)
 		}
 		seen[child.Name] = struct{}{}
+		switch child.OnFailure {
+		case "", OnFailureReport, OnFailurePropagate:
+		default:
+			return fmt.Errorf("%w: child %q on_failure must be %q or %q", ErrInvalid, child.Name, OnFailureReport, OnFailurePropagate)
+		}
 		for j, cap := range child.Capabilities {
 			cap.Name = strings.TrimSpace(cap.Name)
 			if cap.Name == "" {
