@@ -134,6 +134,15 @@ type runState struct {
 	// the run that spawned it, and a parent records its children in spawn order.
 	parentRunID string
 	childRunIDs []string
+	// childSpawnOffsets records, parallel to childRunIDs, the journal position at
+	// which each child was spawned. It lets a fork-from-offset retry start the
+	// cascade cursor past children whose spawn call is replayed from the shared
+	// prefix, so only re-executed children are reused.
+	childSpawnOffsets []int
+	// failureOffset is the journal length captured when the run last failed; a hard
+	// retry forks just before it so the failing step re-executes over a shared
+	// copy-on-write prefix rather than re-running from scratch.
+	failureOffset int
 	// cascade re-execution state: when a run is restarted, cascade is set so the
 	// delegation router reuses (retries) the existing children at cascadeCursor in
 	// spawn order rather than spawning fresh ones.
@@ -709,13 +718,18 @@ func (r *Runtime) Retry(runID string, mode RetryMode, overrides []CapabilityConf
 		replacementManifest = &effective
 	}
 	if mode == RetryRestart {
+		// A hard retry of a failed run forks just before the failing step so the
+		// completed prefix is shared copy-on-write and only the failure onward is
+		// re-executed. Any other restart (e.g. redoing a completed run) shares no
+		// prefix and re-runs from the beginning.
+		forkOffset := 0
+		if run.status == RunFailed && run.failureOffset > 0 {
+			forkOffset = run.failureOffset - 1
+		}
 		parent := r.runContextLocked(run)
 		run.revision++
 		child := r.runContextLocked(run)
-		// Mint a fresh revision via copy-on-write fork rather than mutating the
-		// journal in place. A full restart shares no recorded prefix (offset 0),
-		// so the prior revision is preserved intact and remains addressable.
-		if err := r.stateStore.ForkJournal(context.Background(), parent, child, 0); err != nil {
+		if err := r.stateStore.ForkJournal(context.Background(), parent, child, forkOffset); err != nil {
 			r.mu.Unlock()
 			return RunSnapshot{}, err
 		}
@@ -726,10 +740,16 @@ func (r *Runtime) Retry(runID string, mode RetryMode, overrides []CapabilityConf
 		}
 		run.journal = journal
 		run.preserveSession = false
-		// Re-executing from scratch: reuse the existing child subtree in spawn
-		// order rather than spawning fresh children (deep cascade resume).
+		// Reuse the existing child subtree in spawn order (deep cascade resume).
+		// Children whose spawn call is replayed from the shared prefix are skipped;
+		// the cursor starts at the first child re-executed past the fork offset.
 		run.cascade = true
 		run.cascadeCursor = 0
+		for _, off := range run.childSpawnOffsets {
+			if off < forkOffset {
+				run.cascadeCursor++
+			}
+		}
 	} else {
 		run.preserveSession = run.status == RunYielded || run.status == RunWaitingTask
 		run.cascade = false
@@ -742,6 +762,7 @@ func (r *Runtime) Retry(runID string, mode RetryMode, overrides []CapabilityConf
 	run.answer = ""
 	run.err = ""
 	run.failure = nil
+	run.failureOffset = 0
 	run.stopRequested = false
 	run.startedAt = nil
 	run.completedAt = nil
@@ -1046,6 +1067,11 @@ func (r *Runtime) finishLocked(run *runState, status RunStatus, answer string, e
 	} else {
 		run.err = ""
 	}
+	if status == RunFailed && run.journal != nil {
+		// Record where the run stopped so a hard retry can fork just before the
+		// failing step instead of re-running from the beginning.
+		run.failureOffset = run.journal.Length()
+	}
 	thread := r.threads[run.threadID]
 	if thread != nil {
 		if status != RunYielded && status != RunWaitingTask && thread.activeRunID == run.id {
@@ -1266,6 +1292,8 @@ func (r *Runtime) restore(ctx context.Context) error {
 			brainDigest:       brain.Digest,
 			parentRunID:       stored.ParentRunID,
 			childRunIDs:       append([]string(nil), stored.ChildRunIDs...),
+			childSpawnOffsets: append([]int(nil), stored.ChildSpawnOffsets...),
+			failureOffset:     stored.FailureOffset,
 		}
 		if run.revision == 0 {
 			run.revision = 1
@@ -1363,6 +1391,8 @@ func (r *Runtime) storedRunLocked(run *runState) StoredRun {
 		BrainDigest:       run.brainDigest,
 		ParentRunID:       run.parentRunID,
 		ChildRunIDs:       append([]string(nil), run.childRunIDs...),
+		ChildSpawnOffsets: append([]int(nil), run.childSpawnOffsets...),
+		FailureOffset:     run.failureOffset,
 	}
 }
 

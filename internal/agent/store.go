@@ -52,6 +52,11 @@ type StoredRun struct {
 	// ChildRunIDs records, in spawn order, the child runs this run delegated to.
 	ParentRunID string
 	ChildRunIDs []string
+	// ChildSpawnOffsets records the journal position each child was spawned at,
+	// parallel to ChildRunIDs. FailureOffset is the journal length captured when
+	// the run last failed, used to fork a hard retry just before the failing step.
+	ChildSpawnOffsets []int
+	FailureOffset     int
 }
 
 type StoredMessage struct {
@@ -75,6 +80,9 @@ type StateStore interface {
 	AppendMessages(context.Context, string, string, []HistoryMessage) error
 	OpenJournal(context.Context, RunContext) (journaled.Journal, error)
 	ForkJournal(context.Context, RunContext, RunContext, int) error
+	// ForkInfo reports the copy-on-write fork offset for a revision and whether
+	// the revision is a fork (false for an independent base revision).
+	ForkInfo(context.Context, RunContext) (offset int, forked bool, err error)
 	AcquireLease(context.Context, string, string, string, string, time.Time, time.Duration) (bool, error)
 	ReleaseLease(context.Context, string, string, string, string) error
 }

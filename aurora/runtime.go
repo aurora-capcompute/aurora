@@ -10,6 +10,8 @@ type Runtime interface {
 	CreateRun(threadID string, message string, overrides []CapabilityConfig) (RunSnapshot, error)
 	GetRun(runID string) (RunSnapshot, error)
 	Journal(runID string) ([]JournalEntry, error)
+	CallGraph(runID string) (RunGraphNode, error)
+	ThreadGraph(threadID string) (ThreadGraph, error)
 	Tasks(runID string) ([]TaskSnapshot, error)
 	ResolveTask(taskID string, token string, resolution Resolution) (TaskSnapshot, error)
 	Stop(runID string) (RunSnapshot, error)

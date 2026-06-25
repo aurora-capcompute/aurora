@@ -56,11 +56,12 @@ func (finalDispatcher) Dispatch(_ context.Context, _ RunContext, call dispatcher
 }
 
 type runtimeStore struct {
-	mu       sync.Mutex
-	state    StoredState
-	journals map[string]*testJournal
-	tasks    map[string]task.Record
-	leases   map[string]string
+	mu             sync.Mutex
+	state          StoredState
+	journals       map[string]*testJournal
+	tasks          map[string]task.Record
+	leases         map[string]string
+	lastForkOffset int
 }
 
 func newRuntimeStore() *runtimeStore {
@@ -135,7 +136,18 @@ func (s *runtimeStore) ForkJournal(_ context.Context, parent, child RunContext, 
 		parent: s.journals[parent.SessionKey()],
 		offset: offset,
 	}
+	s.lastForkOffset = offset
 	return nil
+}
+
+func (s *runtimeStore) ForkInfo(_ context.Context, key RunContext) (int, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	journal := s.journals[key.SessionKey()]
+	if journal == nil || journal.parent == nil {
+		return 0, false, nil
+	}
+	return journal.offset, true, nil
 }
 
 func (s *runtimeStore) AcquireLease(_ context.Context, tenant, kind, resource, holder string, _ time.Time, _ time.Duration) (bool, error) {
@@ -731,5 +743,159 @@ func TestRuntimeChildFailurePropagatesToParent(t *testing.T) {
 	failed := waitForStatus(t, runtime, run.ID, RunFailed)
 	if !strings.Contains(failed.Error, "child") {
 		t.Fatalf("parent error = %q, want it to mention the failed child", failed.Error)
+	}
+}
+
+// failThenSucceedDispatchers drives a run that does a tool call, then on its
+// second turn requests an unavailable capability (failing the run) on the first
+// attempt and finishes on the second. The shared counter persists across the
+// run's attempts.
+type failThenSucceedDispatchers struct {
+	mu    sync.Mutex
+	turn2 int
+}
+
+func (*failThenSucceedDispatchers) Normalize(_ string, settings json.RawMessage) (json.RawMessage, error) {
+	if len(settings) == 0 {
+		return json.RawMessage(`{}`), nil
+	}
+	return append(json.RawMessage(nil), settings...), nil
+}
+
+func (d *failThenSucceedDispatchers) NewDispatcher(_ context.Context, _ RunContext, _ Manifest) (dispatcher.Dispatcher[RunContext], error) {
+	return &failThenSucceedDispatcher{parent: d}, nil
+}
+
+func (*failThenSucceedDispatchers) IsSubset(_ string, _, _ json.RawMessage) error { return nil }
+
+type failThenSucceedDispatcher struct{ parent *failThenSucceedDispatchers }
+
+func (d *failThenSucceedDispatcher) Capabilities() []dispatcher.Capability {
+	return []dispatcher.Capability{{
+		Name:        "tool.x",
+		Description: "test tool",
+		InputSchema: json.RawMessage(`{"type":"object"}`),
+	}}
+}
+
+func (d *failThenSucceedDispatcher) Dispatch(_ context.Context, _ RunContext, call dispatcher.Call) (dispatcher.Outcome, error) {
+	switch call.Name {
+	case "tool.x":
+		return dispatcher.Result(json.RawMessage(`{"ok":true}`)), nil
+	case "openai.chat":
+		var req struct {
+			Messages []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		_ = json.Unmarshal(call.Args, &req)
+		hasTool := false
+		for _, m := range req.Messages {
+			if m.Role == "tool" {
+				hasTool = true
+			}
+		}
+		if !hasTool {
+			return chatActions(`{"actions":[{"action":"tool.x","content":{}}]}`), nil
+		}
+		d.parent.mu.Lock()
+		d.parent.turn2++
+		n := d.parent.turn2
+		d.parent.mu.Unlock()
+		if n == 1 {
+			// First attempt: request a capability that was not granted; the brain
+			// rejects it and the run fails after several recorded steps.
+			return chatActions(`{"actions":[{"action":"missing.tool","content":{}}]}`), nil
+		}
+		return chatActions(`{"actions":[{"action":"final","content":{"answer":"recovered"}}]}`), nil
+	default:
+		return dispatcher.Failed("unsupported call: " + call.Name), nil
+	}
+}
+
+func TestRuntimeHardRetryForksFromFailurePoint(t *testing.T) {
+	if _, err := exec.LookPath("tinygo"); err != nil {
+		t.Skip("tinygo not found")
+	}
+	store := newRuntimeStore()
+	runtime, err := NewRuntime(context.Background(), Config{
+		Brains: staticBrains{
+			defaultID: "brain@1",
+			sources:   []BrainSource{{ID: "brain@1", Wasm: buildBrain(t)}},
+		},
+		Dispatchers:  &failThenSucceedDispatchers{},
+		StateStore:   store,
+		TaskStore:    store,
+		SessionStore: newRuntimeSessions(),
+		TaskSecret:   []byte("stable-secret"),
+		IDSource:     sequentialIDs(),
+	})
+	if err != nil {
+		t.Fatalf("new runtime: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := runtime.Close(ctx); err != nil {
+			t.Errorf("close runtime: %v", err)
+		}
+	})
+
+	thread, err := runtime.CreateThread(Manifest{
+		Version:      ManifestVersion,
+		Brain:        "brain@1",
+		Capabilities: []CapabilityConfig{{Name: "tool.x"}},
+	})
+	if err != nil {
+		t.Fatalf("create thread: %v", err)
+	}
+	run, err := runtime.CreateRun(thread.ID, "task", nil)
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	failed := waitForStatus(t, runtime, run.ID, RunFailed)
+	if failed.Error == "" {
+		t.Fatal("expected a failure error")
+	}
+
+	// Hard retry must fork from the failure point over a shared copy-on-write
+	// prefix, not re-run from scratch.
+	if _, err := runtime.Retry(run.ID, RetryRestart, nil); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	recovered := waitForStatus(t, runtime, run.ID, RunCompleted)
+	if recovered.Answer != "recovered" {
+		t.Fatalf("answer = %q, want recovered", recovered.Answer)
+	}
+	store.mu.Lock()
+	off := store.lastForkOffset
+	store.mu.Unlock()
+	if off <= 0 {
+		t.Fatalf("fork offset = %d, want > 0 (hard retry should share the pre-failure prefix)", off)
+	}
+
+	// The thread graph exposes both revisions of the run, with revision 2 forked
+	// from revision 1 at the failure point.
+	graph, err := runtime.ThreadGraph(thread.ID)
+	if err != nil {
+		t.Fatalf("thread graph: %v", err)
+	}
+	if len(graph.Runs) != 1 {
+		t.Fatalf("graph runs = %d, want 1", len(graph.Runs))
+	}
+	gr := graph.Runs[0]
+	if gr.CurrentRevision != 2 || len(gr.Revisions) != 2 {
+		t.Fatalf("revisions = %d, current = %d, want 2/2", len(gr.Revisions), gr.CurrentRevision)
+	}
+	if gr.Revisions[0].Forked {
+		t.Fatal("revision 1 must not be a fork")
+	}
+	rev2 := gr.Revisions[1]
+	if !rev2.Forked || rev2.ForkParent != 1 || rev2.ForkOffset != off {
+		t.Fatalf("revision 2 fork meta = %+v, want forked from rev 1 at offset %d", rev2, off)
+	}
+	if len(gr.Revisions[0].Entries) == 0 || len(rev2.Entries) == 0 {
+		t.Fatal("both revisions should expose journal entries")
 	}
 }

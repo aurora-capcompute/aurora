@@ -290,7 +290,14 @@ func (r *Runtime) createChildRun(parentRunID string, threadID string, message st
 		return RunSnapshot{}, err
 	}
 	if parent := r.runs[parentRunID]; parent != nil {
+		spawnOffset := 0
+		if parent.journal != nil {
+			// The position this call.<child> occupies in the parent journal; it is
+			// recorded once the dispatch returns.
+			spawnOffset = parent.journal.Length()
+		}
 		parent.childRunIDs = append(parent.childRunIDs, runID)
+		parent.childSpawnOffsets = append(parent.childSpawnOffsets, spawnOffset)
 		_ = r.stateStore.SaveRun(context.Background(), r.storedRunLocked(parent))
 	}
 	snapshot := r.runSnapshotLocked(run)
