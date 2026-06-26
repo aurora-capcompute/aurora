@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"strings"
 	"time"
 )
@@ -71,8 +70,6 @@ func (c *delegationChild) onChildFailure(parentRunID string, err error) (dispatc
 }
 
 func (c *delegationChild) dispatch(ctx context.Context, parent RunContext, call dispatcher.Call) (dispatcher.Outcome, error) {
-	slog.Info("delegation: dispatch started", "child", c.manifest.Name)
-
 	var args delegateArgs
 	if err := json.Unmarshal(call.Args, &args); err != nil {
 		return dispatcher.Failed(fmt.Sprintf("decode delegation args: %v", err)), nil
@@ -84,7 +81,6 @@ func (c *delegationChild) dispatch(ctx context.Context, parent RunContext, call 
 	// this position (in spawn order) and retry it, which recursively cascades the
 	// restart down its own subtree.
 	if childID, threadID, ok := c.runtime.nextCascadeChild(parent.RunID); ok {
-		slog.Info("delegation: cascade retry", "child", c.manifest.Name, "run_id", childID)
 		if _, err := c.runtime.Retry(childID, RetryRestart, nil); err != nil {
 			return dispatcher.Failed(fmt.Sprintf("cascade retry child: %v", err)), nil
 		}
@@ -98,32 +94,20 @@ func (c *delegationChild) dispatch(ctx context.Context, parent RunContext, call 
 		}
 		return dispatcher.Result(result), nil
 	}
-	slog.Info("delegation: creating child", "child", c.manifest.Name, "message_len", len(args.Message))
 
 	childManifest := buildChildManifest(c.manifest, args.SystemPrompt)
-	slog.Info("delegation: child manifest built", "brain", childManifest.Brain, "caps", len(childManifest.Capabilities))
-
 	thread, err := c.runtime.CreateThread(childManifest)
 	if err != nil {
-		slog.Error("delegation: create thread failed", "child", c.manifest.Name, "error", err)
 		return dispatcher.Failed(fmt.Sprintf("create child thread: %v", err)), nil
 	}
-	slog.Info("delegation: thread created", "child", c.manifest.Name, "thread_id", thread.ID)
-
 	run, err := c.runtime.createChildRun(parent.RunID, thread.ID, args.Message)
 	if err != nil {
-		slog.Error("delegation: create run failed", "child", c.manifest.Name, "error", err)
 		return dispatcher.Failed(fmt.Sprintf("create child run: %v", err)), nil
 	}
-	slog.Info("delegation: run created, waiting for completion", "child", c.manifest.Name, "run_id", run.ID)
-
 	answer, err := c.runtime.waitForCompletion(ctx, run.ID, thread.ID)
 	if err != nil {
-		slog.Error("delegation: wait failed", "child", c.manifest.Name, "run_id", run.ID, "error", err)
 		return c.onChildFailure(parent.RunID, err)
 	}
-	slog.Info("delegation: completed", "child", c.manifest.Name, "answer_len", len(answer))
-
 	result, marshalErr := json.Marshal(delegateResult{Answer: answer})
 	if marshalErr != nil {
 		return dispatcher.Outcome{}, marshalErr
@@ -310,7 +294,6 @@ func (r *Runtime) createChildRun(parentRunID string, threadID string, message st
 }
 
 func (r *Runtime) waitForCompletion(ctx context.Context, runID, threadID string) (string, error) {
-	slog.Info("waitForCompletion: subscribing", "run_id", runID, "thread_id", threadID)
 	_, events, unsubscribe, err := r.Subscribe(threadID)
 	if err != nil {
 		return "", fmt.Errorf("subscribe to child thread: %w", err)
@@ -318,64 +301,55 @@ func (r *Runtime) waitForCompletion(ctx context.Context, runID, threadID string)
 	defer unsubscribe()
 
 	if snapshot, err := r.GetRun(runID); err == nil {
-		slog.Info("waitForCompletion: initial status", "run_id", runID, "status", snapshot.Status)
-		switch snapshot.Status {
-		case RunCompleted:
-			return snapshot.Answer, nil
-		case RunFailed:
-			return "", fmt.Errorf("child run failed: %s", snapshot.Error)
-		case RunStopped:
-			return "", fmt.Errorf("child run stopped")
-		case RunInterrupted:
-			return "", fmt.Errorf("child run interrupted")
+		if answer, done, runErr := childTerminal(snapshot); done {
+			return answer, runErr
 		}
-	} else {
-		slog.Error("waitForCompletion: GetRun failed", "run_id", runID, "error", err)
 	}
 
 	timeout := 5 * time.Minute
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
-	slog.Info("waitForCompletion: entering event loop", "run_id", runID, "timeout", timeout)
 	for {
 		select {
 		case <-ctx.Done():
-			slog.Warn("waitForCompletion: context cancelled", "run_id", runID)
 			_, _ = r.Stop(runID)
 			return "", ctx.Err()
 		case <-timer.C:
-			slog.Warn("waitForCompletion: timed out", "run_id", runID)
 			_, _ = r.Stop(runID)
 			return "", fmt.Errorf("child run timed out after %s", timeout)
 		case event, ok := <-events:
 			if !ok {
-				slog.Warn("waitForCompletion: event stream closed", "run_id", runID)
 				return "", fmt.Errorf("child event stream closed")
 			}
-			slog.Info("waitForCompletion: event received", "run_id", runID, "type", event.Type)
 			if event.Type != "run.updated" {
 				continue
 			}
 			snapshot, ok := event.Data.(RunSnapshot)
-			if !ok {
-				slog.Warn("waitForCompletion: event data not RunSnapshot", "run_id", runID, "data_type", fmt.Sprintf("%T", event.Data))
+			if !ok || snapshot.ID != runID {
 				continue
 			}
-			if snapshot.ID != runID {
-				continue
-			}
-			slog.Info("waitForCompletion: run status update", "run_id", runID, "status", snapshot.Status, "error", snapshot.Error)
-			switch snapshot.Status {
-			case RunCompleted:
-				return snapshot.Answer, nil
-			case RunFailed:
-				return "", fmt.Errorf("child run failed: %s", snapshot.Error)
-			case RunStopped:
-				return "", fmt.Errorf("child run stopped")
-			case RunInterrupted:
-				return "", fmt.Errorf("child run interrupted")
+			if answer, done, runErr := childTerminal(snapshot); done {
+				return answer, runErr
 			}
 		}
+	}
+}
+
+// childTerminal reports whether a child run snapshot has reached a terminal state,
+// returning its answer (on completion) or the corresponding error. done is false
+// while the run is still in flight.
+func childTerminal(snapshot RunSnapshot) (answer string, done bool, err error) {
+	switch snapshot.Status {
+	case RunCompleted:
+		return snapshot.Answer, true, nil
+	case RunFailed:
+		return "", true, fmt.Errorf("child run failed: %s", snapshot.Error)
+	case RunStopped:
+		return "", true, fmt.Errorf("child run stopped")
+	case RunInterrupted:
+		return "", true, fmt.Errorf("child run interrupted")
+	default:
+		return "", false, nil
 	}
 }
