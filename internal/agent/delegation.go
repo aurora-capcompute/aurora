@@ -259,14 +259,14 @@ func (r *Runtime) createChildRun(parentRunID string, threadID string, message st
 	}
 	thread.activeRunID = runID
 	thread.updatedAt = now
-	if err := r.stateStore.SaveRun(context.Background(), r.storedRunLocked(run)); err != nil {
+	if err := r.appendRun(run); err != nil {
 		delete(r.runs, runID)
 		thread.runIDs = thread.runIDs[:len(thread.runIDs)-1]
 		thread.activeRunID = ""
 		r.mu.Unlock()
 		return RunSnapshot{}, err
 	}
-	if err := r.stateStore.SaveThread(context.Background(), r.storedThreadLocked(thread)); err != nil {
+	if err := r.appendThread(thread); err != nil {
 		delete(r.runs, runID)
 		thread.runIDs = thread.runIDs[:len(thread.runIDs)-1]
 		thread.activeRunID = ""
@@ -282,7 +282,7 @@ func (r *Runtime) createChildRun(parentRunID string, threadID string, message st
 		}
 		parent.childRunIDs = append(parent.childRunIDs, runID)
 		parent.childSpawnOffsets = append(parent.childSpawnOffsets, spawnOffset)
-		_ = r.stateStore.SaveRun(context.Background(), r.storedRunLocked(parent))
+		_ = r.appendRun(parent)
 	}
 	snapshot := r.runSnapshotLocked(run)
 	r.mu.Unlock()

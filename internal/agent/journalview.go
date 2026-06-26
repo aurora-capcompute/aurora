@@ -62,7 +62,7 @@ type logJournal struct {
 	run      string
 	rev      uint64
 	now      func() time.Time
-	onAppend func(position int, call dispatcher.Call, outcome dispatcher.Outcome)
+	onAppend func(run string, position int, call dispatcher.Call, outcome dispatcher.Outcome)
 
 	mu      sync.Mutex
 	parent  *logJournal
@@ -71,7 +71,7 @@ type logJournal struct {
 }
 
 func newLogJournal(log eventlog.Log, scope eventlog.Scope, run string, rev uint64, now func() time.Time,
-	onAppend func(int, dispatcher.Call, dispatcher.Outcome)) *logJournal {
+	onAppend func(string, int, dispatcher.Call, dispatcher.Outcome)) *logJournal {
 	return &logJournal{log: log, scope: scope, run: run, rev: rev, now: now, onAppend: onAppend}
 }
 
@@ -116,7 +116,7 @@ func (j *logJournal) Store(index int, call dispatcher.Call, outcome dispatcher.O
 	j.records = append(j.records, journaled.Record{Call: call.Copy(), Outcome: outcome.Copy()})
 	j.mu.Unlock()
 	if j.onAppend != nil {
-		j.onAppend(index, call, outcome)
+		j.onAppend(j.run, index, call, outcome)
 	}
 	return nil
 }
@@ -146,7 +146,7 @@ func (j *logJournal) fork(childRev uint64, offset int) (*logJournal, error) {
 // parents. The result is keyed by run id then revision; the runtime selects each
 // run's current revision and lets new records append onto it.
 func foldJournals(events []eventlog.Event, log eventlog.Log, scope eventlog.Scope, now func() time.Time,
-	onAppend func(int, dispatcher.Call, dispatcher.Outcome)) (map[string]map[uint64]*logJournal, error) {
+	onAppend func(string, int, dispatcher.Call, dispatcher.Outcome)) (map[string]map[uint64]*logJournal, error) {
 	own := map[string]map[uint64][]journaled.Record{}
 	forks := map[string]map[uint64]forkedData{}
 	revs := map[string]map[uint64]struct{}{}

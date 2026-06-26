@@ -4,9 +4,6 @@ import (
 	"context"
 	"fmt"
 	"time"
-
-	"aurora-capcompute/internal/task"
-	"capcompute/dispatcher/replay/tape/journaled"
 )
 
 const DefaultTenantID = "local"
@@ -22,6 +19,8 @@ func (r RunContext) SessionKey() string {
 	return fmt.Sprintf("%s/%s/%d", r.TenantID, r.RunID, r.Revision)
 }
 
+// StoredThread is a thread's durable state, carried by thread.state events and
+// folded back into memory on restore.
 type StoredThread struct {
 	TenantID    string
 	ID          string
@@ -32,6 +31,8 @@ type StoredThread struct {
 	ActiveRunID string
 }
 
+// StoredRun is a run's durable state, carried by run.state events and folded
+// back into memory on restore.
 type StoredRun struct {
 	TenantID          string
 	ID                string
@@ -59,37 +60,11 @@ type StoredRun struct {
 	FailureOffset     int
 }
 
-type StoredMessage struct {
-	TenantID string
-	ThreadID string
-	Position int
-	Role     string
-	Content  string
-}
-
-type StoredState struct {
-	Threads  []StoredThread
-	Runs     []StoredRun
-	Messages []StoredMessage
-}
-
-type StateStore interface {
-	Load(context.Context, string) (StoredState, error)
-	SaveThread(context.Context, StoredThread) error
-	SaveRun(context.Context, StoredRun) error
-	AppendMessages(context.Context, string, string, []HistoryMessage) error
-	OpenJournal(context.Context, RunContext) (journaled.Journal, error)
-	ForkJournal(context.Context, RunContext, RunContext, int) error
-	// ForkInfo reports the copy-on-write fork offset for a revision and whether
-	// the revision is a fork (false for an independent base revision).
-	ForkInfo(context.Context, RunContext) (offset int, forked bool, err error)
-	AcquireLease(context.Context, string, string, string, string, time.Time, time.Duration) (bool, error)
-	ReleaseLease(context.Context, string, string, string, string) error
-}
-
-type TaskStore = task.Store
-
-type Store interface {
-	StateStore
-	TaskStore
+// Leases coordinates exclusive run and task execution across runtime instances.
+// It is deliberately separate from the event log: a lease is ephemeral
+// coordination (a fencing token with a TTL), not part of a thread's immutable
+// history.
+type Leases interface {
+	Acquire(ctx context.Context, tenantID, kind, resourceID, holder string, now time.Time, ttl time.Duration) (bool, error)
+	Release(ctx context.Context, tenantID, kind, resourceID, holder string) error
 }

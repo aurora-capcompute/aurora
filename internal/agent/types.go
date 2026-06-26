@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"aurora-capcompute/internal/eventlog"
 	internalhost "aurora-capcompute/internal/host"
 	"aurora-capcompute/internal/task"
 )
@@ -50,8 +51,8 @@ type HistoryMessage struct {
 type Config struct {
 	Brains       BrainProvider
 	Dispatchers  DispatcherProvider
-	StateStore   StateStore
-	TaskStore    TaskStore
+	Log          eventlog.Log
+	Leases       Leases
 	SessionStore capcompute.SessionStore[string, RunKey]
 	IDSource     func(prefix string) (string, error)
 	Now          func() time.Time
@@ -68,8 +69,9 @@ type Runtime struct {
 	computes          map[string]*capcompute.ComputeCompiledPlugin[string, RunKey]
 	brains            *loadedBrains
 	sessionStore      capcompute.SessionStore[string, RunKey]
-	stateStore        StateStore
-	taskStore         TaskStore
+	log               eventlog.Log
+	leases            Leases
+	tasks             *eventTaskStore
 	tenantID          string
 	threads           map[string]*threadState
 	runs              map[string]*runState
