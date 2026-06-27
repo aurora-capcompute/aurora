@@ -1,3 +1,12 @@
+// Package task owns durable approval: when a brain yields a capability that
+// needs out-of-band confirmation, this package turns the yield into a persisted
+// task record, mints an HMAC-derived token the caller resolves against, and on
+// approval replays the original call back through the wrapped dispatcher. A
+// task's token hash is the only secret-derived value the store persists out of
+// band; the record itself omits it from JSON.
+//
+// It owns the task lifecycle and token scheme, not the capability behind the
+// task — the underlying dispatcher and the durable store are injected.
 package task
 
 import (

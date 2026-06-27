@@ -2,9 +2,10 @@
 
 Implementation-neutral Aurora orchestration library built on `capcompute`.
 
-The module owns thread and run lifecycle, replay journals, durable approval
-tasks, retries, leases, event subscriptions, and execution of caller-supplied
-Wasm brains. It does not provide:
+The module owns thread and run lifecycle, the replay journal, durable approval
+tasks, retries, event subscriptions, and execution of caller-supplied Wasm
+brains. All durable state is a fold of a single append-only event log — the
+runtime keeps no mutable row store. It does not provide:
 
 - LLM, internet, Kubernetes, Helm, MCP, or other capabilities.
 - Dispatcher registries or capability-specific manifest settings.
@@ -22,8 +23,8 @@ Applications compose those implementations explicitly.
 runtime, err := aurora.NewRuntime(ctx, aurora.Config{
     Brains:       brainProvider,
     Dispatchers:  dispatcherProvider,
-    StateStore:   stateStore,
-    TaskStore:    taskStore,
+    Log:          eventLog,
+    Leases:       leases,
     SessionStore: sessionStore,
     TaskSecret:   taskSecret,
 })
@@ -69,13 +70,26 @@ approval and replay middleware.
 
 ## Storage contracts
 
-`aurora.StateStore` persists threads, runs, messages, journals, and leases.
-`aurora.TaskStore` persists yielded approval tasks. A single adapter may
-implement both through `aurora.Store`. Physical Wasm sessions use the
+State is event-sourced. The application supplies one append-only log; the
+runtime appends domain events and folds them back into projections on restore.
+
+```go
+type EventLog interface {
+    Append(ctx context.Context, scope LogScope, events ...LogEvent) (head uint64, err error)
+    Read(ctx context.Context, scope LogScope, after uint64) ([]LogEvent, error)
+    Streams(ctx context.Context, tenantID string) ([]LogScope, error)
+}
+```
+
+One stream per thread carries every thread, run, task, and capability-journal
+event. There is no mutable row store: threads, runs, tasks, and the replay
+journal are all projections of the log. Cross-instance coordination uses a
+separate `Leases` interface — an ephemeral fencing token with a TTL, kept out of
+a thread's immutable history. Physical Wasm sessions use the
 `capcompute.SessionStore[string, aurora.RunContext]` contract.
 
-Concrete memory and SQLite adapters live in the separate `aurora-stores`
-repository.
+Concrete in-memory and SQLite event logs (and leases) live in the separate
+`aurora-stores` repository.
 
 ## Manifest helpers
 
