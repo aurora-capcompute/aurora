@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"aurora-capcompute/internal/eventlog"
 	internalhost "aurora-capcompute/internal/host"
 	"aurora-capcompute/internal/task"
 
@@ -27,11 +28,11 @@ func NewRuntime(ctx context.Context, config Config) (*Runtime, error) {
 	if config.Dispatchers == nil {
 		return nil, fmt.Errorf("%w: dispatcher provider is required", ErrInvalid)
 	}
-	if config.StateStore == nil {
-		return nil, fmt.Errorf("%w: state store is required", ErrInvalid)
+	if config.Log == nil {
+		return nil, fmt.Errorf("%w: event log is required", ErrInvalid)
 	}
-	if config.TaskStore == nil {
-		return nil, fmt.Errorf("%w: task store is required", ErrInvalid)
+	if config.Leases == nil {
+		return nil, fmt.Errorf("%w: leases are required", ErrInvalid)
 	}
 	if config.SessionStore == nil {
 		return nil, fmt.Errorf("%w: session store is required", ErrInvalid)
@@ -47,8 +48,8 @@ func NewRuntime(ctx context.Context, config Config) (*Runtime, error) {
 		computes:     make(map[string]*capcompute.ComputeCompiledPlugin[string, RunKey]),
 		brains:       brains,
 		sessionStore: config.SessionStore,
-		stateStore:   config.StateStore,
-		taskStore:    config.TaskStore,
+		log:          config.Log,
+		leases:       config.Leases,
 		tenantID:     strings.TrimSpace(config.TenantID),
 		threads:      make(map[string]*threadState),
 		runs:         make(map[string]*runState),
@@ -71,6 +72,7 @@ func NewRuntime(ctx context.Context, config Config) (*Runtime, error) {
 	if runtime.now == nil {
 		runtime.now = time.Now
 	}
+	runtime.tasks = newEventTaskStore(runtime.log, runtime.now)
 	if runtime.eventSize <= 0 {
 		runtime.eventSize = 32
 	}
@@ -129,9 +131,10 @@ func NewRuntime(ctx context.Context, config Config) (*Runtime, error) {
 			if run != nil && run.journal != nil {
 				return run.journal, nil
 			}
-			return runtime.stateStore.OpenJournal(context.Background(), key)
+			return newLogJournal(runtime.log, runtime.scope(key.ThreadID), key.RunID, key.Revision,
+				runtime.journalNow, runtime.journalAppendPublisher(key.ThreadID)), nil
 		},
-		Tasks:      runtime.taskStore,
+		Tasks:      runtime.tasks,
 		TaskSecret: runtime.taskSecret,
 		TaskTTL:    runtime.taskTTL,
 		TaskScope: func(key RunKey) task.Scope {
@@ -288,7 +291,7 @@ func (r *Runtime) CreateThread(manifest Manifest) (ThreadSnapshot, error) {
 	if r.closed {
 		return ThreadSnapshot{}, fmt.Errorf("%w: runtime is closed", ErrConflict)
 	}
-	if err := r.stateStore.SaveThread(context.Background(), r.storedThreadLocked(thread)); err != nil {
+	if err := r.appendThread(thread); err != nil {
 		return ThreadSnapshot{}, err
 	}
 	r.threads[id] = thread
@@ -378,14 +381,14 @@ func (r *Runtime) CreateRun(threadID string, message string, overrides []Capabil
 	}
 	thread.activeRunID = runID
 	thread.updatedAt = now
-	if err := r.stateStore.SaveRun(context.Background(), r.storedRunLocked(run)); err != nil {
+	if err := r.appendRun(run); err != nil {
 		delete(r.runs, runID)
 		thread.runIDs = thread.runIDs[:len(thread.runIDs)-1]
 		thread.activeRunID = ""
 		r.mu.Unlock()
 		return RunSnapshot{}, err
 	}
-	if err := r.stateStore.SaveThread(context.Background(), r.storedThreadLocked(thread)); err != nil {
+	if err := r.appendThread(thread); err != nil {
 		delete(r.runs, runID)
 		thread.runIDs = thread.runIDs[:len(thread.runIDs)-1]
 		thread.activeRunID = ""
@@ -449,7 +452,7 @@ func (r *Runtime) Tasks(runID string) ([]TaskSnapshot, error) {
 	if run == nil {
 		return nil, fmt.Errorf("%w: run %s", ErrNotFound, runID)
 	}
-	records, err := r.taskStore.List(context.Background(), r.tenantID, runID)
+	records, err := r.tasks.List(context.Background(), r.tenantID, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -469,7 +472,7 @@ func (r *Runtime) ResolveTask(taskID, token string, resolution task.Resolution) 
 	if resolution.Decision == task.StateCompleted && !json.Valid(resolution.Data) {
 		return TaskSnapshot{}, fmt.Errorf("%w: completed task data must be valid JSON", ErrInvalid)
 	}
-	acquired, err := r.stateStore.AcquireLease(
+	acquired, err := r.leases.Acquire(
 		context.Background(), r.tenantID, "task", taskID,
 		r.instanceID, r.now().UTC(), time.Minute,
 	)
@@ -479,10 +482,10 @@ func (r *Runtime) ResolveTask(taskID, token string, resolution task.Resolution) 
 	if !acquired {
 		return TaskSnapshot{}, fmt.Errorf("%w: task is being resolved", ErrConflict)
 	}
-	defer r.stateStore.ReleaseLease(context.Background(), r.tenantID, "task", taskID, r.instanceID)
+	defer r.leases.Release(context.Background(), r.tenantID, "task", taskID, r.instanceID)
 
 	sum := sha256.Sum256([]byte(token))
-	record, err := r.taskStore.Resolve(
+	record, err := r.tasks.Resolve(
 		context.Background(), r.tenantID, taskID, sum[:], resolution, r.now().UTC(),
 	)
 	if err != nil {
@@ -531,9 +534,9 @@ func (r *Runtime) Stop(runID string) (RunSnapshot, error) {
 		return RunSnapshot{}, fmt.Errorf("%w: run %s cannot be stopped from %s", ErrConflict, runID, run.status)
 	}
 	snapshot := r.runSnapshotLocked(run)
-	_ = r.stateStore.SaveRun(context.Background(), r.storedRunLocked(run))
+	_ = r.appendRun(run)
 	if thread := r.threads[run.threadID]; thread != nil {
-		_ = r.stateStore.SaveThread(context.Background(), r.storedThreadLocked(thread))
+		_ = r.appendThread(thread)
 	}
 	r.mu.Unlock()
 	if closeSession != nil {
@@ -600,19 +603,18 @@ func (r *Runtime) Retry(runID string, mode RetryMode, overrides []CapabilityConf
 		if run.status == RunFailed && run.failureOffset > 0 {
 			forkOffset = run.failureOffset - 1
 		}
-		parent := r.runContextLocked(run)
+		parentJournal, ok := run.journal.(*logJournal)
+		if !ok {
+			r.mu.Unlock()
+			return RunSnapshot{}, fmt.Errorf("%w: run %s has no forkable journal", ErrConflict, run.id)
+		}
 		run.revision++
-		child := r.runContextLocked(run)
-		if err := r.stateStore.ForkJournal(context.Background(), parent, child, forkOffset); err != nil {
+		forked, forkErr := parentJournal.fork(run.revision, forkOffset)
+		if forkErr != nil {
 			r.mu.Unlock()
-			return RunSnapshot{}, err
+			return RunSnapshot{}, forkErr
 		}
-		journal, journalErr := r.newJournal(run)
-		if journalErr != nil {
-			r.mu.Unlock()
-			return RunSnapshot{}, journalErr
-		}
-		run.journal = journal
+		run.journal = forked
 		run.preserveSession = false
 		// Reuse the existing child subtree in spawn order (deep cascade resume).
 		// Children whose spawn call is replayed from the shared prefix are skipped;
@@ -643,11 +645,11 @@ func (r *Runtime) Retry(runID string, mode RetryMode, overrides []CapabilityConf
 	run.updatedAt = r.now().UTC()
 	thread.activeRunID = run.id
 	thread.updatedAt = run.updatedAt
-	if err := r.stateStore.SaveRun(context.Background(), r.storedRunLocked(run)); err != nil {
+	if err := r.appendRun(run); err != nil {
 		r.mu.Unlock()
 		return RunSnapshot{}, err
 	}
-	if err := r.stateStore.SaveThread(context.Background(), r.storedThreadLocked(thread)); err != nil {
+	if err := r.appendThread(thread); err != nil {
 		r.mu.Unlock()
 		return RunSnapshot{}, err
 	}
@@ -753,7 +755,7 @@ func (r *Runtime) execute(runID string) {
 		return
 	}
 	leaseResource := fmt.Sprintf("%s/%d", run.id, run.revision)
-	acquired, leaseErr := r.stateStore.AcquireLease(
+	acquired, leaseErr := r.leases.Acquire(
 		context.Background(), r.tenantID, "run", leaseResource,
 		r.instanceID, r.now().UTC(), r.leaseTTL,
 	)
@@ -763,9 +765,9 @@ func (r *Runtime) execute(runID string) {
 			err = errors.New("run is leased by another Aurora instance")
 		}
 		r.finishLocked(run, RunInterrupted, "", err)
-		_ = r.stateStore.SaveRun(context.Background(), r.storedRunLocked(run))
+		_ = r.appendRun(run)
 		if thread := r.threads[run.threadID]; thread != nil {
-			_ = r.stateStore.SaveThread(context.Background(), r.storedThreadLocked(thread))
+			_ = r.appendThread(thread)
 		}
 		snapshot := r.runSnapshotLocked(run)
 		threadID := run.threadID
@@ -773,7 +775,7 @@ func (r *Runtime) execute(runID string) {
 		r.publish(threadID, Event{Type: "run.updated", Data: snapshot})
 		return
 	}
-	defer r.stateStore.ReleaseLease(
+	defer r.leases.Release(
 		context.Background(), r.tenantID, "run", leaseResource, r.instanceID,
 	)
 	session := run.session
@@ -833,7 +835,7 @@ func (r *Runtime) execute(runID string) {
 	run.updatedAt = now
 	snapshot := r.runSnapshotLocked(run)
 	threadID := run.threadID
-	_ = r.stateStore.SaveRun(context.Background(), r.storedRunLocked(run))
+	_ = r.appendRun(run)
 	r.mu.Unlock()
 	r.publish(threadID, Event{Type: "run.updated", Data: snapshot})
 
@@ -868,7 +870,7 @@ func (r *Runtime) execute(runID string) {
 		}
 		r.finish(runID, RunCompleted, answer, nil)
 	case capcompute.PlayYielded:
-		tasks, taskErr := r.taskStore.List(context.Background(), r.tenantID, runID)
+		tasks, taskErr := r.tasks.List(context.Background(), r.tenantID, runID)
 		if taskErr == nil && hasPendingTask(tasks) {
 			r.finish(runID, RunWaitingTask, "", nil)
 		} else {
@@ -914,12 +916,12 @@ func (r *Runtime) finish(runID string, status RunStatus, answer string, err erro
 		return
 	}
 	r.finishLocked(run, status, answer, err)
-	_ = r.stateStore.SaveRun(context.Background(), r.storedRunLocked(run))
+	_ = r.appendRun(run)
 	if thread := r.threads[run.threadID]; thread != nil {
 		// Conversation history is no longer persisted separately; it is derived
 		// from the thread's completed runs (each run stores its message + answer)
 		// and rebuilt on recovery.
-		_ = r.stateStore.SaveThread(context.Background(), r.storedThreadLocked(thread))
+		_ = r.appendThread(thread)
 	}
 	snapshot := r.runSnapshotLocked(run)
 	threadID := run.threadID
@@ -959,26 +961,53 @@ func (r *Runtime) finishLocked(run *runState, status RunStatus, answer string, e
 	}
 }
 
-func (r *Runtime) newJournal(run *runState) (journaled.Journal, error) {
-	journal, err := r.stateStore.OpenJournal(context.Background(), r.runContextLocked(run))
-	if err != nil {
-		return nil, err
+// scope returns the event stream key for a thread.
+func (r *Runtime) scope(threadID string) eventlog.Scope {
+	return eventlog.Scope{TenantID: r.tenantID, ThreadID: threadID}
+}
+
+func (r *Runtime) journalNow() time.Time { return r.now().UTC() }
+
+// journalAppendPublisher publishes a journal.appended event for a thread when a
+// capability record is appended to one of its runs' journals.
+func (r *Runtime) journalAppendPublisher(threadID string) func(string, int, dispatcher.Call, dispatcher.Outcome) {
+	return func(runID string, index int, call dispatcher.Call, outcome dispatcher.Outcome) {
+		r.publish(threadID, Event{
+			Type: "journal.appended",
+			Data: JournalEvent{
+				RunID:         runID,
+				Index:         index,
+				Call:          call.Name,
+				OutcomeStatus: outcome.Kind(),
+				OutcomeSize:   len(outcome.Result()),
+			},
+		})
 	}
-	return &observableJournal{
-		Journal: journal,
-		onStore: func(index int, call dispatcher.Call, outcome dispatcher.Outcome) {
-			r.publish(run.threadID, Event{
-				Type: "journal.appended",
-				Data: JournalEvent{
-					RunID:         run.id,
-					Index:         index,
-					Call:          call.Name,
-					OutcomeStatus: outcome.Kind(),
-					OutcomeSize:   len(outcome.Result()),
-				},
-			})
-		},
-	}, nil
+}
+
+// appendThread records a thread's current state to its event stream.
+func (r *Runtime) appendThread(thread *threadState) error {
+	ev, err := threadStateEvent(r.now().UTC(), r.storedThreadLocked(thread))
+	if err != nil {
+		return err
+	}
+	_, err = r.log.Append(context.Background(), r.scope(thread.id), ev)
+	return err
+}
+
+// appendRun records a run's current state to its thread's event stream.
+func (r *Runtime) appendRun(run *runState) error {
+	ev, err := runStateEvent(r.now().UTC(), r.storedRunLocked(run))
+	if err != nil {
+		return err
+	}
+	_, err = r.log.Append(context.Background(), r.scope(run.threadID), ev)
+	return err
+}
+
+func (r *Runtime) newJournal(run *runState) (journaled.Journal, error) {
+	return newLogJournal(r.log, r.scope(run.threadID), run.id, run.revision,
+		r.journalNow, r.journalAppendPublisher(run.threadID)), nil
 }
 
 func (r *Runtime) publish(threadID string, event Event) {
@@ -1090,112 +1119,138 @@ func copyTime(value *time.Time) *time.Time {
 }
 
 func (r *Runtime) restore(ctx context.Context) error {
-	state, err := r.stateStore.Load(ctx, r.tenantID)
+	scopes, err := r.log.Streams(ctx, r.tenantID)
 	if err != nil {
 		return err
 	}
-	for _, stored := range state.Threads {
-		if stored.Manifest.Brain == "" {
-			stored.Manifest.Brain = r.brains.DefaultID()
-		}
-		stored.Manifest, err = ValidateManifest(stored.Manifest, r.dispatchers)
+	for _, scope := range scopes {
+		events, err := r.log.Read(ctx, scope, 0)
 		if err != nil {
 			return err
 		}
-		if _, err := r.brains.Resolve(stored.Manifest.Brain); err != nil {
+		proj, err := Fold(events)
+		if err != nil {
 			return err
 		}
-		thread := &threadState{
-			id:          stored.ID,
-			title:       stored.Title,
-			createdAt:   stored.CreatedAt,
-			updatedAt:   stored.UpdatedAt,
-			activeRunID: stored.ActiveRunID,
-			manifest:    cloneManifest(stored.Manifest),
+		journals, err := foldJournals(events, r.log, scope, r.journalNow, r.journalAppendPublisher(scope.ThreadID))
+		if err != nil {
+			return err
 		}
-		r.threads[thread.id] = thread
+		if err := r.restoreThread(proj, journals); err != nil {
+			return err
+		}
+		r.tasks.seed(proj.TaskList())
 	}
-	// Conversation history is derived from completed runs (each stores its
-	// message + answer), accumulated below in run order, rather than loaded from a
-	// separate message store.
-	sort.Slice(state.Runs, func(i, j int) bool {
-		return state.Runs[i].CreatedAt.Before(state.Runs[j].CreatedAt)
-	})
-	for _, stored := range state.Runs {
-		if stored.EffectiveManifest.Brain == "" {
-			stored.EffectiveManifest.Brain = r.brains.DefaultID()
+	return nil
+}
+
+// restoreThread folds one thread's projection back into memory: it rebuilds the
+// thread, its runs (in creation order, deriving conversation history from
+// completed runs), and attaches each run's journal revision. Runs left mid-flight
+// by a crash are marked interrupted and re-recorded.
+func (r *Runtime) restoreThread(proj Projection, journals map[string]map[uint64]*logJournal) error {
+	stored := proj.Thread
+	if stored.ID == "" {
+		return nil
+	}
+	if stored.Manifest.Brain == "" {
+		stored.Manifest.Brain = r.brains.DefaultID()
+	}
+	manifest, err := ValidateManifest(stored.Manifest, r.dispatchers)
+	if err != nil {
+		return err
+	}
+	if _, err := r.brains.Resolve(manifest.Brain); err != nil {
+		return err
+	}
+	thread := &threadState{
+		id:          stored.ID,
+		title:       stored.Title,
+		createdAt:   stored.CreatedAt,
+		updatedAt:   stored.UpdatedAt,
+		activeRunID: stored.ActiveRunID,
+		manifest:    cloneManifest(manifest),
+	}
+	r.threads[thread.id] = thread
+
+	runs := make([]StoredRun, 0, len(proj.Runs))
+	for _, sr := range proj.Runs {
+		runs = append(runs, sr)
+	}
+	sort.Slice(runs, func(i, j int) bool { return runs[i].CreatedAt.Before(runs[j].CreatedAt) })
+
+	for _, sr := range runs {
+		if sr.EffectiveManifest.Brain == "" {
+			sr.EffectiveManifest.Brain = r.brains.DefaultID()
 		}
-		stored.EffectiveManifest, err = ValidateManifest(stored.EffectiveManifest, r.dispatchers)
+		em, err := ValidateManifest(sr.EffectiveManifest, r.dispatchers)
 		if err != nil {
 			return err
 		}
-		if _, err := r.brains.Resolve(stored.EffectiveManifest.Brain); err != nil {
-			return err
-		}
-		brain, err := r.brains.Resolve(stored.EffectiveManifest.Brain)
+		brain, err := r.brains.Resolve(em.Brain)
 		if err != nil {
 			return err
 		}
-		if stored.BrainDigest != "" && stored.BrainDigest != brain.Digest {
+		if sr.BrainDigest != "" && sr.BrainDigest != brain.Digest {
 			slog.Info("skipping run with outdated brain digest",
-				"run_id", stored.ID, "brain", brain.ID,
-				"stored_digest", stored.BrainDigest, "current_digest", brain.Digest)
+				"run_id", sr.ID, "brain", brain.ID,
+				"stored_digest", sr.BrainDigest, "current_digest", brain.Digest)
 			continue
 		}
-		status := stored.Status
+		status := sr.Status
 		if status == RunQueued || status == RunRunning || status == RunStopping {
 			status = RunInterrupted
 		}
 		run := &runState{
-			id:                stored.ID,
-			threadID:          stored.ThreadID,
-			message:           stored.Message,
+			id:                sr.ID,
+			threadID:          sr.ThreadID,
+			message:           sr.Message,
 			status:            status,
-			attempt:           stored.Attempt,
-			revision:          stored.Revision,
-			createdAt:         stored.CreatedAt,
-			updatedAt:         stored.UpdatedAt,
-			startedAt:         copyTime(stored.StartedAt),
-			completedAt:       copyTime(stored.CompletedAt),
-			answer:            stored.Answer,
-			err:               stored.Error,
-			effectiveManifest: cloneManifest(stored.EffectiveManifest),
+			attempt:           sr.Attempt,
+			revision:          sr.Revision,
+			createdAt:         sr.CreatedAt,
+			updatedAt:         sr.UpdatedAt,
+			startedAt:         copyTime(sr.StartedAt),
+			completedAt:       copyTime(sr.CompletedAt),
+			answer:            sr.Answer,
+			err:               sr.Error,
+			effectiveManifest: cloneManifest(em),
 			brainDigest:       brain.Digest,
-			parentRunID:       stored.ParentRunID,
-			childRunIDs:       append([]string(nil), stored.ChildRunIDs...),
-			childSpawnOffsets: append([]int(nil), stored.ChildSpawnOffsets...),
-			failureOffset:     stored.FailureOffset,
+			parentRunID:       sr.ParentRunID,
+			childRunIDs:       append([]string(nil), sr.ChildRunIDs...),
+			childSpawnOffsets: append([]int(nil), sr.ChildSpawnOffsets...),
+			failureOffset:     sr.FailureOffset,
 		}
 		if run.revision == 0 {
 			run.revision = 1
 		}
-		run.journal, err = r.newJournal(run)
-		if err != nil {
-			return err
-		}
-		r.runs[run.id] = run
-		if thread := r.threads[run.threadID]; thread != nil {
-			run.history = append([]HistoryMessage(nil), thread.history...)
-			thread.runIDs = append(thread.runIDs, run.id)
-			if run.status == RunCompleted {
-				thread.history = append(thread.history,
-					HistoryMessage{Role: "user", Content: run.message},
-					HistoryMessage{Role: "assistant", Content: run.answer},
-				)
+		if j := journals[run.id][run.revision]; j != nil {
+			run.journal = j
+		} else {
+			run.journal, err = r.newJournal(run)
+			if err != nil {
+				return err
 			}
 		}
-		if status != stored.Status {
-			if err := r.stateStore.SaveRun(ctx, r.storedRunLocked(run)); err != nil {
+		r.runs[run.id] = run
+		run.history = append([]HistoryMessage(nil), thread.history...)
+		thread.runIDs = append(thread.runIDs, run.id)
+		if run.status == RunCompleted {
+			thread.history = append(thread.history,
+				HistoryMessage{Role: "user", Content: run.message},
+				HistoryMessage{Role: "assistant", Content: run.answer},
+			)
+		}
+		if status != sr.Status {
+			if err := r.appendRun(run); err != nil {
 				return err
 			}
 		}
 	}
-	for _, thread := range r.threads {
-		if thread.activeRunID != "" && r.runs[thread.activeRunID] == nil {
-			slog.Info("clearing active run from thread due to brain digest mismatch",
-				"thread_id", thread.id, "run_id", thread.activeRunID)
-			thread.activeRunID = ""
-		}
+	if thread.activeRunID != "" && r.runs[thread.activeRunID] == nil {
+		slog.Info("clearing active run from thread due to brain digest mismatch",
+			"thread_id", thread.id, "run_id", thread.activeRunID)
+		thread.activeRunID = ""
 	}
 	return nil
 }
@@ -1273,19 +1328,4 @@ func randomID(prefix string) (string, error) {
 		return "", err
 	}
 	return prefix + hex.EncodeToString(raw[:]), nil
-}
-
-type observableJournal struct {
-	journaled.Journal
-	onStore func(index int, call dispatcher.Call, outcome dispatcher.Outcome)
-}
-
-func (j *observableJournal) Store(index int, call dispatcher.Call, outcome dispatcher.Outcome) error {
-	if err := j.Journal.Store(index, call, outcome); err != nil {
-		return err
-	}
-	if j.onStore != nil {
-		j.onStore(index, call, outcome)
-	}
-	return nil
 }

@@ -2,9 +2,7 @@ package agent
 
 import (
 	"context"
-	"crypto/hmac"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -15,10 +13,9 @@ import (
 	"testing"
 	"time"
 
-	"aurora-capcompute/internal/task"
+	"aurora-capcompute/internal/eventlog"
 	"capcompute"
 	"capcompute/dispatcher"
-	"capcompute/dispatcher/replay/tape/journaled"
 )
 
 type runtimeDispatchers struct {
@@ -56,101 +53,16 @@ func (finalDispatcher) Dispatch(_ context.Context, _ RunContext, call dispatcher
 }
 
 type runtimeStore struct {
-	mu             sync.Mutex
-	state          StoredState
-	journals       map[string]*testJournal
-	tasks          map[string]task.Record
-	leases         map[string]string
-	lastForkOffset int
+	log    *eventlog.Memory
+	mu     sync.Mutex
+	leases map[string]string
 }
 
 func newRuntimeStore() *runtimeStore {
-	return &runtimeStore{
-		journals: make(map[string]*testJournal),
-		tasks:    make(map[string]task.Record),
-		leases:   make(map[string]string),
-	}
+	return &runtimeStore{log: eventlog.NewMemory(), leases: make(map[string]string)}
 }
 
-func (s *runtimeStore) Load(context.Context, string) (StoredState, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.state, nil
-}
-
-func (s *runtimeStore) SaveThread(_ context.Context, thread StoredThread) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for i := range s.state.Threads {
-		if s.state.Threads[i].ID == thread.ID {
-			s.state.Threads[i] = thread
-			return nil
-		}
-	}
-	s.state.Threads = append(s.state.Threads, thread)
-	return nil
-}
-
-func (s *runtimeStore) SaveRun(_ context.Context, run StoredRun) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for i := range s.state.Runs {
-		if s.state.Runs[i].ID == run.ID {
-			s.state.Runs[i] = run
-			return nil
-		}
-	}
-	s.state.Runs = append(s.state.Runs, run)
-	return nil
-}
-
-func (s *runtimeStore) AppendMessages(_ context.Context, tenantID, threadID string, messages []HistoryMessage) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	position := len(s.state.Messages)
-	for _, message := range messages {
-		s.state.Messages = append(s.state.Messages, StoredMessage{
-			TenantID: tenantID, ThreadID: threadID, Position: position,
-			Role: message.Role, Content: message.Content,
-		})
-		position++
-	}
-	return nil
-}
-
-func (s *runtimeStore) OpenJournal(_ context.Context, key RunContext) (journaled.Journal, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	journal := s.journals[key.SessionKey()]
-	if journal == nil {
-		journal = &testJournal{}
-		s.journals[key.SessionKey()] = journal
-	}
-	return journal, nil
-}
-
-func (s *runtimeStore) ForkJournal(_ context.Context, parent, child RunContext, offset int) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.journals[child.SessionKey()] = &testJournal{
-		parent: s.journals[parent.SessionKey()],
-		offset: offset,
-	}
-	s.lastForkOffset = offset
-	return nil
-}
-
-func (s *runtimeStore) ForkInfo(_ context.Context, key RunContext) (int, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	journal := s.journals[key.SessionKey()]
-	if journal == nil || journal.parent == nil {
-		return 0, false, nil
-	}
-	return journal.offset, true, nil
-}
-
-func (s *runtimeStore) AcquireLease(_ context.Context, tenant, kind, resource, holder string, _ time.Time, _ time.Duration) (bool, error) {
+func (s *runtimeStore) Acquire(_ context.Context, tenant, kind, resource, holder string, _ time.Time, _ time.Duration) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := tenant + "/" + kind + "/" + resource
@@ -161,7 +73,7 @@ func (s *runtimeStore) AcquireLease(_ context.Context, tenant, kind, resource, h
 	return true, nil
 }
 
-func (s *runtimeStore) ReleaseLease(_ context.Context, tenant, kind, resource, holder string) error {
+func (s *runtimeStore) Release(_ context.Context, tenant, kind, resource, holder string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := tenant + "/" + kind + "/" + resource
@@ -171,112 +83,33 @@ func (s *runtimeStore) ReleaseLease(_ context.Context, tenant, kind, resource, h
 	return nil
 }
 
-func (s *runtimeStore) Find(_ context.Context, scope task.Scope, position int, hash string) (task.Record, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, record := range s.tasks {
-		if record.Scope == scope && record.JournalPosition == position && record.CallHash == hash {
-			return record, true, nil
+// seed appends thread.state/run.state events so the runtime folds them on restore.
+func (s *runtimeStore) seed(t StoredThread, runs ...StoredRun) {
+	now := time.Now().UTC()
+	ev, _ := threadStateEvent(now, t)
+	_, _ = s.log.Append(context.Background(), eventlog.Scope{TenantID: t.TenantID, ThreadID: t.ID}, ev)
+	for _, r := range runs {
+		rev, _ := runStateEvent(now, r)
+		_, _ = s.log.Append(context.Background(), eventlog.Scope{TenantID: r.TenantID, ThreadID: r.ThreadID}, rev)
+	}
+}
+
+// lastForkOffset returns the offset of the most recent run.forked event, or 0.
+func (s *runtimeStore) lastForkOffset() int {
+	streams, _ := s.log.Streams(context.Background(), "local")
+	offset := 0
+	for _, scope := range streams {
+		events, _ := s.log.Read(context.Background(), scope, 0)
+		for _, ev := range events {
+			if ev.Kind == evForked {
+				var fd forkedData
+				if json.Unmarshal(ev.Data, &fd) == nil {
+					offset = fd.Offset
+				}
+			}
 		}
 	}
-	return task.Record{}, false, nil
-}
-
-func (s *runtimeStore) Create(_ context.Context, record task.Record) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, exists := s.tasks[record.ID]; exists {
-		return task.ErrConflict
-	}
-	s.tasks[record.ID] = record
-	return nil
-}
-
-func (s *runtimeStore) Get(_ context.Context, _ string, taskID string) (task.Record, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	record, ok := s.tasks[taskID]
-	if !ok {
-		return task.Record{}, task.ErrNotFound
-	}
-	return record, nil
-}
-
-func (s *runtimeStore) List(_ context.Context, _ string, runID string) ([]task.Record, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var records []task.Record
-	for _, record := range s.tasks {
-		if runID == "" || record.Scope.RunID == runID {
-			records = append(records, record)
-		}
-	}
-	return records, nil
-}
-
-func (s *runtimeStore) Resolve(_ context.Context, _ string, taskID string, tokenHash []byte, resolution task.Resolution, now time.Time) (task.Record, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	record, ok := s.tasks[taskID]
-	if !ok {
-		return task.Record{}, task.ErrNotFound
-	}
-	if !hmac.Equal(record.TokenHash, tokenHash) {
-		return task.Record{}, task.ErrUnauthorized
-	}
-	record.State = resolution.Decision
-	record.Resolution = resolution
-	record.ResolvedAt = &now
-	s.tasks[taskID] = record
-	return record, nil
-}
-
-func (s *runtimeStore) MarkExecuted(_ context.Context, _ string, taskID string, _ time.Time) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	record := s.tasks[taskID]
-	record.State = task.StateExecuted
-	s.tasks[taskID] = record
-	return nil
-}
-
-type testJournal struct {
-	mu      sync.Mutex
-	records []journaled.Record
-	parent  *testJournal
-	offset  int
-}
-
-func (j *testJournal) Load(index int) (journaled.Record, error) {
-	j.mu.Lock()
-	parent := j.parent
-	offset := j.offset
-	if parent != nil && index < offset {
-		j.mu.Unlock()
-		return parent.Load(index)
-	}
-	defer j.mu.Unlock()
-	local := index - offset
-	if local < 0 || local >= len(j.records) {
-		return journaled.Record{}, errors.New("record not found")
-	}
-	return j.records[local], nil
-}
-
-func (j *testJournal) Store(index int, call dispatcher.Call, outcome dispatcher.Outcome) error {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	if index != j.offset+len(j.records) {
-		return errors.New("invalid index")
-	}
-	j.records = append(j.records, journaled.Record{Call: call.Copy(), Outcome: outcome.Copy()})
-	return nil
-}
-
-func (j *testJournal) Length() int {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	return j.offset + len(j.records)
+	return offset
 }
 
 type runtimeSessions struct {
@@ -311,16 +144,16 @@ func TestNewRuntimeRequiresImplementationDependencies(t *testing.T) {
 	sessions := newRuntimeSessions()
 	brains := staticBrains{defaultID: "brain@1", sources: []BrainSource{{ID: "brain@1", Wasm: []byte("wasm")}}}
 	base := Config{
-		Brains: brains, Dispatchers: dispatchers, StateStore: store,
-		TaskStore: store, SessionStore: sessions, TaskSecret: []byte("secret"),
+		Brains: brains, Dispatchers: dispatchers, Log: store.log,
+		Leases: store, SessionStore: sessions, TaskSecret: []byte("secret"),
 	}
 	tests := []struct {
 		name   string
 		mutate func(*Config)
 	}{
 		{name: "dispatcher provider", mutate: func(config *Config) { config.Dispatchers = nil }},
-		{name: "state store", mutate: func(config *Config) { config.StateStore = nil }},
-		{name: "task store", mutate: func(config *Config) { config.TaskStore = nil }},
+		{name: "event log", mutate: func(config *Config) { config.Log = nil }},
+		{name: "leases", mutate: func(config *Config) { config.Leases = nil }},
 		{name: "session store", mutate: func(config *Config) { config.SessionStore = nil }},
 		{name: "task secret", mutate: func(config *Config) { config.TaskSecret = nil }},
 	}
@@ -347,8 +180,8 @@ func TestRuntimePassesEffectiveManifestToDispatcherProvider(t *testing.T) {
 			sources:   []BrainSource{{ID: "brain@1", Wasm: buildBrain(t)}},
 		},
 		Dispatchers:  dispatchers,
-		StateStore:   store,
-		TaskStore:    store,
+		Log:          store.log,
+		Leases:       store,
 		SessionStore: newRuntimeSessions(),
 		TaskSecret:   []byte("stable-secret"),
 		IDSource:     sequentialIDs(),
@@ -411,8 +244,8 @@ func TestRuntimeSetBrainsLifecycle(t *testing.T) {
 	runtime, err := NewRuntime(context.Background(), Config{
 		Brains:       nil, // boot with zero brains
 		Dispatchers:  dispatchers,
-		StateStore:   store,
-		TaskStore:    store,
+		Log:          store.log,
+		Leases:       store,
 		SessionStore: newRuntimeSessions(),
 		TaskSecret:   []byte("stable-secret"),
 		IDSource:     sequentialIDs(),
@@ -475,26 +308,26 @@ func TestRuntimeSetBrainsLifecycle(t *testing.T) {
 func TestRuntimeRejectsPersistedBrainDigestMismatch(t *testing.T) {
 	store := newRuntimeStore()
 	now := time.Now().UTC()
-	store.state = StoredState{
-		Threads: []StoredThread{{
+	store.seed(
+		StoredThread{
 			TenantID: "local", ID: "thread", CreatedAt: now, UpdatedAt: now,
 			Manifest: Manifest{Version: ManifestVersion, Brain: "brain@1"},
-		}},
-		Runs: []StoredRun{{
+		},
+		StoredRun{
 			TenantID: "local", ID: "run", ThreadID: "thread", Revision: 1,
 			Status: RunCompleted, CreatedAt: now, UpdatedAt: now,
 			EffectiveManifest: Manifest{Version: ManifestVersion, Brain: "brain@1"},
 			BrainDigest:       "different",
-		}},
-	}
+		},
+	)
 	_, err := NewRuntime(context.Background(), Config{
 		Brains: staticBrains{
 			defaultID: "brain@1",
 			sources:   []BrainSource{{ID: "brain@1", Wasm: []byte("wasm")}},
 		},
 		Dispatchers:  &runtimeDispatchers{},
-		StateStore:   store,
-		TaskStore:    store,
+		Log:          store.log,
+		Leases:       store,
 		SessionStore: newRuntimeSessions(),
 		TaskSecret:   []byte("stable-secret"),
 	})
@@ -656,8 +489,8 @@ func TestRuntimeCascadeResumeReusesChildRun(t *testing.T) {
 			sources:   []BrainSource{{ID: "brain@1", Wasm: buildBrain(t)}},
 		},
 		Dispatchers:  cascadeDispatchers{},
-		StateStore:   store,
-		TaskStore:    store,
+		Log:          store.log,
+		Leases:       store,
 		SessionStore: newRuntimeSessions(),
 		TaskSecret:   []byte("stable-secret"),
 		IDSource:     sequentialIDs(),
@@ -778,8 +611,8 @@ func TestRuntimeChildFailurePropagatesToParent(t *testing.T) {
 			sources:   []BrainSource{{ID: "brain@1", Wasm: buildBrain(t)}},
 		},
 		Dispatchers:  failingChildDispatchers{},
-		StateStore:   store,
-		TaskStore:    store,
+		Log:          store.log,
+		Leases:       store,
 		SessionStore: newRuntimeSessions(),
 		TaskSecret:   []byte("stable-secret"),
 		IDSource:     sequentialIDs(),
@@ -898,8 +731,8 @@ func TestRuntimeHardRetryForksFromFailurePoint(t *testing.T) {
 			sources:   []BrainSource{{ID: "brain@1", Wasm: buildBrain(t)}},
 		},
 		Dispatchers:  &failThenSucceedDispatchers{},
-		StateStore:   store,
-		TaskStore:    store,
+		Log:          store.log,
+		Leases:       store,
 		SessionStore: newRuntimeSessions(),
 		TaskSecret:   []byte("stable-secret"),
 		IDSource:     sequentialIDs(),
@@ -941,9 +774,7 @@ func TestRuntimeHardRetryForksFromFailurePoint(t *testing.T) {
 	if recovered.Answer != "recovered" {
 		t.Fatalf("answer = %q, want recovered", recovered.Answer)
 	}
-	store.mu.Lock()
-	off := store.lastForkOffset
-	store.mu.Unlock()
+	off := store.lastForkOffset()
 	if off <= 0 {
 		t.Fatalf("fork offset = %d, want > 0 (hard retry should share the pre-failure prefix)", off)
 	}

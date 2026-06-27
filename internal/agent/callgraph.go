@@ -110,17 +110,24 @@ func (r *Runtime) ThreadGraph(threadID string) (ThreadGraph, error) {
 
 func (r *Runtime) revisionView(scope RunContext) (RevisionView, error) {
 	ctx := context.Background()
-	offset, forked, err := r.stateStore.ForkInfo(ctx, scope)
+	stream := r.scope(scope.ThreadID)
+	events, err := r.log.Read(ctx, stream, 0)
 	if err != nil {
 		return RevisionView{}, err
 	}
-	view := RevisionView{Revision: scope.Revision, Forked: forked, ForkOffset: offset}
-	if forked {
-		view.ForkParent = scope.Revision - 1
-	}
-	journal, err := r.stateStore.OpenJournal(ctx, scope)
+	journals, err := foldJournals(events, r.log, stream, r.journalNow, nil)
 	if err != nil {
 		return RevisionView{}, err
+	}
+	view := RevisionView{Revision: scope.Revision}
+	journal := journals[scope.RunID][scope.Revision]
+	if journal == nil {
+		return view, nil
+	}
+	if journal.parent != nil {
+		view.Forked = true
+		view.ForkOffset = journal.offset
+		view.ForkParent = journal.parent.rev
 	}
 	length := journal.Length()
 	for i := 0; i < length; i++ {

@@ -2,6 +2,7 @@ package aurora
 
 import (
 	"aurora-capcompute/internal/agent"
+	"aurora-capcompute/internal/eventlog"
 	"aurora-capcompute/internal/task"
 	"aurora-dispatchers/resolution"
 )
@@ -57,14 +58,14 @@ type BrainSource = agent.BrainSource
 type BrainProvider = agent.BrainProvider
 type DispatcherProvider = agent.DispatcherProvider
 
-// Store interface and its type surface
+// Event log: the single append-only source of truth. Applications provide an
+// EventLog implementation (and a Leases implementation for cross-instance
+// coordination); the runtime folds the log into thread/run/task projections.
 
-type Store = agent.Store
-type StateStore = agent.StateStore
-type StoredState = agent.StoredState
-type StoredThread = agent.StoredThread
-type StoredRun = agent.StoredRun
-type StoredMessage = agent.StoredMessage
+type EventLog = eventlog.Log
+type LogEvent = eventlog.Event
+type LogScope = eventlog.Scope
+type Leases = agent.Leases
 type RunContext = agent.RunContext
 
 // Task types
@@ -73,7 +74,6 @@ type TaskScope = task.Scope
 type TaskRecord = task.Record
 type TaskState = task.State
 type Resolution = resolution.Resolution
-type TaskStore = agent.TaskStore
 
 const (
 	TaskStatePending   = task.StatePending
