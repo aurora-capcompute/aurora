@@ -52,15 +52,10 @@ func (r *Runtime) restoreThread(proj Projection, journals map[string]map[uint64]
 	if err != nil {
 		return err
 	}
-	if _, err := r.brains.Resolve(manifest.Brain); err != nil {
-		// Brain not yet registered (dynamic brain loading: SetBrains called after
-		// restore). Skip the thread; it will be unreachable until the brain is
-		// loaded. This also naturally discards threads from a previous brain ID
-		// scheme that no longer matches any registered brain.
-		slog.Info("skipping thread restore: brain not registered",
-			"thread_id", stored.ID, "brain", manifest.Brain)
-		return nil
-	}
+	// Do not gate thread restore on brain availability: threads are always
+	// visible regardless of whether the brain has been registered yet (brains
+	// are loaded after restore via SetBrains). Runs that reference an
+	// unregistered or digest-mismatched brain are skipped below.
 	thread := &threadState{
 		id:          stored.ID,
 		title:       stored.Title,
