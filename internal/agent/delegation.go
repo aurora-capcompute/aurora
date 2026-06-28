@@ -1,10 +1,10 @@
 package agent
 
 import (
-	"github.com/aurora-capcompute/capcompute/dispatcher"
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/aurora-capcompute/capcompute/dispatcher"
 	"strings"
 	"time"
 )
@@ -135,6 +135,7 @@ func buildChildManifest(child ChildManifest, systemPromptOverride string) Manife
 	return Manifest{
 		Version:      ManifestVersion,
 		Brain:        child.Brain,
+		BindingRef:   child.BindingRef,
 		SystemPrompt: prompt,
 		Capabilities: caps,
 		Children:     children,

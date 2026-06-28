@@ -12,14 +12,14 @@
 package agent
 
 import (
-	"github.com/aurora-capcompute/capcompute"
-	"github.com/aurora-capcompute/capcompute/dispatcher"
-	"github.com/aurora-capcompute/capcompute/dispatcher/replay/tape/journaled"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/aurora-capcompute/capcompute"
+	"github.com/aurora-capcompute/capcompute/dispatcher"
+	"github.com/aurora-capcompute/capcompute/dispatcher/replay/tape/journaled"
 	"strings"
 	"sync"
 	"time"
@@ -120,9 +120,7 @@ func NewRuntime(ctx context.Context, config Config) (*Runtime, error) {
 				return nil, err
 			}
 			var d dispatcher.Dispatcher[RunKey] = base
-			if hasCapability(manifest, "aurora.log") {
-				d = newProgressDispatcher(d, runtime.publish, key.ThreadID, key.RunID)
-			}
+			d = newProgressDispatcher(d, runtime.publish, key.ThreadID, key.RunID)
 			if len(manifest.Children) > 0 {
 				d = newDelegationRouter(d, manifest.Children, runtime)
 			}

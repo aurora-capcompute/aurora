@@ -1,10 +1,10 @@
 package agent
 
 import (
-	"github.com/aurora-capcompute/capcompute/dispatcher"
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/aurora-capcompute/capcompute/dispatcher"
 )
 
 type progressDispatcher struct {
@@ -39,15 +39,6 @@ func (d *progressDispatcher) Dispatch(ctx context.Context, key RunContext, call 
 
 func (d *progressDispatcher) Capabilities() []dispatcher.Capability {
 	return d.next.Capabilities()
-}
-
-func hasCapability(manifest Manifest, name string) bool {
-	for _, cap := range manifest.Capabilities {
-		if cap.Name == name {
-			return true
-		}
-	}
-	return false
 }
 
 type ProgressEvent struct {

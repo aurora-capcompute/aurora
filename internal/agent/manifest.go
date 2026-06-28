@@ -17,6 +17,7 @@ const (
 type Manifest struct {
 	Version      int                `json:"version"`
 	Brain        string             `json:"brain,omitempty"`
+	BindingRef   string             `json:"binding_ref,omitempty"`
 	SystemPrompt string             `json:"system_prompt,omitempty"`
 	Capabilities []CapabilityConfig `json:"capabilities"`
 	Children     []ChildManifest    `json:"children,omitempty"`
@@ -25,6 +26,7 @@ type Manifest struct {
 type ChildManifest struct {
 	Name         string             `json:"name"`
 	Brain        string             `json:"brain"`
+	BindingRef   string             `json:"binding_ref,omitempty"`
 	SystemPrompt string             `json:"system_prompt,omitempty"`
 	Capabilities []CapabilityConfig `json:"capabilities"`
 	Children     []ChildManifest    `json:"children,omitempty"`
