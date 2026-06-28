@@ -17,6 +17,7 @@ type Runtime interface {
 	ResolveTask(taskID string, token string, resolution Resolution) (TaskSnapshot, error)
 	Stop(runID string) (RunSnapshot, error)
 	Retry(runID string, mode RetryMode, overrides []CapabilityConfig) (RunSnapshot, error)
+	ReplayFrom(runID string, from int) (RunSnapshot, error)
 	Subscribe(threadID string) (Event, <-chan Event, func(), error)
 	Close(ctx context.Context) error
 }

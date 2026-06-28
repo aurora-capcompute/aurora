@@ -33,6 +33,12 @@ type StoredThread struct {
 	// "telegram:chat_id" → "12345"). Channel bridges use them to find their
 	// threads from the log without maintaining a separate mapping store.
 	Tags map[string]string
+	// Revision is a monotonic counter bumped each time a replay creates a new
+	// thread timeline (i.e. truncates the run list to a fork point).
+	Revision uint64 `json:"revision,omitempty"`
+	// RunIDs is the canonical ordered list of runs in the current timeline.
+	// When non-empty it supersedes the CreatedAt sort used by older logs.
+	RunIDs []string `json:"run_ids,omitempty"`
 }
 
 // StoredRun is a run's durable state, carried by run.state events and folded

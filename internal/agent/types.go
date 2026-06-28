@@ -100,6 +100,7 @@ type threadState struct {
 	activeRunID string
 	manifest    Manifest
 	tags        map[string]string
+	revision    uint64
 }
 
 type runState struct {

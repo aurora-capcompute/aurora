@@ -614,27 +614,9 @@ func (r *Runtime) Retry(runID string, mode RetryMode, overrides []CapabilityConf
 		if run.status == RunFailed && run.failureOffset > 0 {
 			forkOffset = run.failureOffset - 1
 		}
-		parentJournal, ok := run.journal.(*logJournal)
-		if !ok {
+		if err := r.forkJournalLocked(run, forkOffset); err != nil {
 			r.mu.Unlock()
-			return RunSnapshot{}, fmt.Errorf("%w: run %s has no forkable journal", ErrConflict, run.id)
-		}
-		run.revision++
-		run.journal = newLogJournal(
-			parentJournal.log, parentJournal.scope, parentJournal.run, run.revision,
-			parentJournal.history, forkOffset,
-			parentJournal.now, parentJournal.onAppend,
-		)
-		run.preserveSession = false
-		// Reuse the existing child subtree in spawn order (deep cascade resume).
-		// Children whose spawn call is replayed from the shared prefix are skipped;
-		// the cursor starts at the first child re-executed past the fork offset.
-		run.cascade = true
-		run.cascadeCursor = 0
-		for _, off := range run.childSpawnOffsets {
-			if off < forkOffset {
-				run.cascadeCursor++
-			}
+			return RunSnapshot{}, err
 		}
 	} else {
 		run.preserveSession = run.status == RunYielded || run.status == RunWaitingTask
@@ -655,6 +637,138 @@ func (r *Runtime) Retry(runID string, mode RetryMode, overrides []CapabilityConf
 	run.updatedAt = r.now().UTC()
 	thread.activeRunID = run.id
 	thread.updatedAt = run.updatedAt
+	if err := r.appendRun(run); err != nil {
+		r.mu.Unlock()
+		return RunSnapshot{}, err
+	}
+	if err := r.appendThread(thread); err != nil {
+		r.mu.Unlock()
+		return RunSnapshot{}, err
+	}
+	snapshot := r.runSnapshotLocked(run)
+	r.mu.Unlock()
+
+	r.publish(run.threadID, Event{Type: "run.updated", Data: snapshot})
+	r.wg.Add(1)
+	go r.execute(runID)
+	return snapshot, nil
+}
+
+// forkJournalLocked re-forks run's journal at forkOffset and sets cascade/preserveSession.
+// Must be called with the runtime mutex held.
+func (r *Runtime) forkJournalLocked(run *runState, forkOffset int) error {
+	parentJournal, ok := run.journal.(*logJournal)
+	if !ok {
+		return fmt.Errorf("%w: run %s has no forkable journal", ErrConflict, run.id)
+	}
+	run.revision++
+	run.journal = newLogJournal(
+		parentJournal.log, parentJournal.scope, parentJournal.run, run.revision,
+		parentJournal.history, forkOffset,
+		parentJournal.now, parentJournal.onAppend,
+	)
+	run.preserveSession = false
+	// Reuse the existing child subtree in spawn order (deep cascade resume).
+	// Children whose spawn call is replayed from the shared prefix are skipped;
+	// the cursor starts at the first child re-executed past the fork offset.
+	run.cascade = true
+	run.cascadeCursor = 0
+	for _, off := range run.childSpawnOffsets {
+		if off < forkOffset {
+			run.cascadeCursor++
+		}
+	}
+	return nil
+}
+
+// ReplayFrom replays run runID starting from journal entry from (0-indexed).
+// It forks the run's journal at that offset (entries 0..from-1 are served from
+// the shared prefix) and truncates the thread's run list to the replayed run,
+// making it the new thread head. The thread revision is bumped.
+//
+// from=0 re-executes the entire run including the initial agent.input step;
+// this is equivalent to a fresh restart.
+func (r *Runtime) ReplayFrom(runID string, from int) (RunSnapshot, error) {
+	if from < 0 {
+		return RunSnapshot{}, fmt.Errorf("%w: from must be >= 0", ErrInvalid)
+	}
+
+	r.mu.Lock()
+	run := r.runs[runID]
+	if run == nil {
+		r.mu.Unlock()
+		return RunSnapshot{}, fmt.Errorf("%w: run %s", ErrNotFound, runID)
+	}
+	switch run.status {
+	case RunCompleted, RunStopped, RunFailed, RunInterrupted:
+	default:
+		r.mu.Unlock()
+		return RunSnapshot{}, fmt.Errorf("%w: run %s must be terminal before replay (status: %s)", ErrConflict, runID, run.status)
+	}
+	if run.parentRunID != "" {
+		r.mu.Unlock()
+		return RunSnapshot{}, fmt.Errorf("%w: only top-level runs can be replayed (run %s is delegated)", ErrConflict, runID)
+	}
+	thread := r.threads[run.threadID]
+	if thread == nil {
+		r.mu.Unlock()
+		return RunSnapshot{}, fmt.Errorf("%w: thread %s not found", ErrNotFound, run.threadID)
+	}
+	if thread.activeRunID != "" {
+		r.mu.Unlock()
+		return RunSnapshot{}, fmt.Errorf("%w: thread already has active run %s; stop it before replaying", ErrConflict, thread.activeRunID)
+	}
+
+	// Validate 'from' against the current journal length.
+	j, ok := run.journal.(*logJournal)
+	if !ok {
+		r.mu.Unlock()
+		return RunSnapshot{}, fmt.Errorf("%w: run %s has no forkable journal", ErrConflict, runID)
+	}
+	jlen := j.Length()
+	if from >= jlen {
+		r.mu.Unlock()
+		return RunSnapshot{}, fmt.Errorf("%w: from=%d out of range for journal length %d", ErrInvalid, from, jlen)
+	}
+
+	// Find the run's position in the thread's timeline.
+	runIdx := -1
+	for i, id := range thread.runIDs {
+		if id == runID {
+			runIdx = i
+			break
+		}
+	}
+	if runIdx < 0 {
+		r.mu.Unlock()
+		return RunSnapshot{}, fmt.Errorf("%w: run %s not found in thread %s", ErrNotFound, runID, run.threadID)
+	}
+
+	// Truncate the thread to runs up to and including the replayed run.
+	// Runs after this point belong to the now-abandoned old timeline.
+	thread.runIDs = append([]string(nil), thread.runIDs[:runIdx+1]...)
+	thread.revision++
+
+	// Fork the run's journal at the replay point.
+	if err := r.forkJournalLocked(run, from); err != nil {
+		r.mu.Unlock()
+		return RunSnapshot{}, err
+	}
+
+	now := r.now().UTC()
+	run.status = RunQueued
+	run.attempt++
+	run.answer = ""
+	run.err = ""
+	run.failure = nil
+	run.failureOffset = 0
+	run.stopRequested = false
+	run.startedAt = nil
+	run.completedAt = nil
+	run.updatedAt = now
+	thread.activeRunID = run.id
+	thread.updatedAt = now
+
 	if err := r.appendRun(run); err != nil {
 		r.mu.Unlock()
 		return RunSnapshot{}, err

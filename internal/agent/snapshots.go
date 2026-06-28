@@ -155,6 +155,8 @@ func (r *Runtime) storedThreadLocked(thread *threadState) StoredThread {
 		Manifest:    cloneManifest(thread.manifest),
 		ActiveRunID: thread.activeRunID,
 		Tags:        cloneTags(thread.tags),
+		Revision:    thread.revision,
+		RunIDs:      append([]string(nil), thread.runIDs...),
 	}
 }
 

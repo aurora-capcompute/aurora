@@ -69,34 +69,31 @@ func (r *Runtime) restoreThread(proj Projection, journals map[string]map[uint64]
 		activeRunID: stored.ActiveRunID,
 		manifest:    cloneManifest(manifest),
 		tags:        cloneTags(stored.Tags),
+		revision:    stored.Revision,
 	}
 	r.threads[thread.id] = thread
 
-	runs := make([]StoredRun, 0, len(proj.Runs))
-	for _, sr := range proj.Runs {
-		runs = append(runs, sr)
-	}
-	sort.Slice(runs, func(i, j int) bool { return runs[i].CreatedAt.Before(runs[j].CreatedAt) })
-
-	for _, sr := range runs {
+	// restoreRun restores a single StoredRun into r.runs. Returns (ok, err):
+	// ok=false means the run was silently skipped (brain mismatch/missing).
+	restoreRun := func(sr StoredRun) (ok bool, err error) {
 		if sr.EffectiveManifest.Brain == "" {
 			sr.EffectiveManifest.Brain = r.brains.DefaultID()
 		}
 		em, err := ValidateManifest(sr.EffectiveManifest, r.dispatchers)
 		if err != nil {
-			return err
+			return false, err
 		}
 		brain, err := r.brains.Resolve(em.Brain)
 		if err != nil {
 			slog.Info("skipping run restore: brain not registered",
 				"run_id", sr.ID, "brain", em.Brain)
-			continue
+			return false, nil
 		}
 		if sr.BrainDigest != "" && sr.BrainDigest != brain.Digest {
 			slog.Info("skipping run with outdated brain digest",
 				"run_id", sr.ID, "brain", brain.ID,
 				"stored_digest", sr.BrainDigest, "current_digest", brain.Digest)
-			continue
+			return false, nil
 		}
 		status := sr.Status
 		if status == RunQueued || status == RunRunning || status == RunStopping {
@@ -128,9 +125,6 @@ func (r *Runtime) restoreThread(proj Projection, journals map[string]map[uint64]
 		if j := journals[run.id][run.revision]; j != nil {
 			run.journal = j
 		} else {
-			// No entries logged for this revision yet (run crashed before any tool
-			// call). Share the existing history so the replay can serve the shared
-			// prefix; forkOffset is derived from the stored failure offset.
 			history := histories[run.id]
 			if history == nil {
 				history = newRunHistory()
@@ -141,22 +135,52 @@ func (r *Runtime) restoreThread(proj Projection, journals map[string]map[uint64]
 			}
 			run.journal, err = r.newJournal(run, history, forkOffset)
 			if err != nil {
-				return err
+				return false, err
 			}
 		}
 		r.runs[run.id] = run
+		if status != sr.Status {
+			if err := r.appendRun(run); err != nil {
+				return false, err
+			}
+		}
+		return true, nil
+	}
+
+	// Restore ALL runs into r.runs so delegated children are reachable for the
+	// cascade resume path, regardless of whether they are in the current timeline.
+	allRuns := make([]StoredRun, 0, len(proj.Runs))
+	for _, sr := range proj.Runs {
+		allRuns = append(allRuns, sr)
+	}
+	sort.Slice(allRuns, func(i, j int) bool { return allRuns[i].CreatedAt.Before(allRuns[j].CreatedAt) })
+	for _, sr := range allRuns {
+		if _, err := restoreRun(sr); err != nil {
+			return err
+		}
+	}
+
+	// Build thread.runIDs and thread.history from the canonical timeline.
+	// When stored.RunIDs is non-empty it carries the post-replay list; otherwise
+	// fall back to the CreatedAt-sorted order (backward compat for old logs).
+	timelineIDs := stored.RunIDs
+	if len(timelineIDs) == 0 {
+		for _, sr := range allRuns {
+			timelineIDs = append(timelineIDs, sr.ID)
+		}
+	}
+	for _, id := range timelineIDs {
+		run := r.runs[id]
+		if run == nil {
+			continue // skipped (brain mismatch or orphaned)
+		}
 		run.history = append([]HistoryMessage(nil), thread.history...)
-		thread.runIDs = append(thread.runIDs, run.id)
+		thread.runIDs = append(thread.runIDs, id)
 		if run.status == RunCompleted {
 			thread.history = append(thread.history,
 				HistoryMessage{Role: "user", Content: run.message},
 				HistoryMessage{Role: "assistant", Content: run.answer},
 			)
-		}
-		if status != sr.Status {
-			if err := r.appendRun(run); err != nil {
-				return err
-			}
 		}
 	}
 	if thread.activeRunID != "" && r.runs[thread.activeRunID] == nil {
