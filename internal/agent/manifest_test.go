@@ -13,11 +13,11 @@ type testDispatchers struct {
 	normalized []string
 }
 
-func (p *testDispatchers) Normalize(name string, settings json.RawMessage) (json.RawMessage, error) {
-	if name == "unknown" {
-		return nil, fmt.Errorf("unsupported capability")
+func (p *testDispatchers) Normalize(toolType string, settings json.RawMessage) (json.RawMessage, error) {
+	if toolType == "unknown" {
+		return nil, fmt.Errorf("unsupported tool type")
 	}
-	p.normalized = append(p.normalized, name)
+	p.normalized = append(p.normalized, toolType)
 	if len(settings) == 0 {
 		return json.RawMessage(`{}`), nil
 	}
@@ -28,37 +28,51 @@ func (*testDispatchers) NewDispatcher(context.Context, RunContext, Manifest) (di
 	return nil, nil
 }
 
-func (*testDispatchers) IsSubset(name string, parent, child json.RawMessage) error {
-	return nil
-}
-
 func TestValidateManifestUsesInjectedProvider(t *testing.T) {
 	provider := &testDispatchers{}
 	manifest, err := ValidateManifest(Manifest{
-		Version: LegacyManifestVersion,
-		Capabilities: []CapabilityConfig{{
-			Name: " custom.call ",
+		Version: ManifestVersion,
+		Brain:   "brain",
+		Tools: []Tool{{
+			Name: " custom ",
+			Type: "core.custom",
 		}},
 	}, provider)
 	if err != nil {
 		t.Fatalf("validate: %v", err)
 	}
-	if manifest.Version != ManifestVersion || manifest.Capabilities[0].Name != "custom.call" {
+	if manifest.Tools[0].Name != "custom" {
 		t.Fatalf("manifest = %+v", manifest)
 	}
-	if string(manifest.Capabilities[0].Settings) != "{}" {
-		t.Fatalf("settings = %s", manifest.Capabilities[0].Settings)
+	if string(manifest.Tools[0].Settings) != "{}" {
+		t.Fatalf("settings = %s", manifest.Tools[0].Settings)
 	}
 }
 
-func TestValidateManifestRejectsMissingProviderAndUnknownCapability(t *testing.T) {
+func TestValidateManifestRejectsMissingProviderAndUnknownType(t *testing.T) {
 	if _, err := ValidateManifest(Manifest{Version: ManifestVersion}, nil); err == nil {
 		t.Fatal("expected missing provider error")
 	}
 	if _, err := ValidateManifest(Manifest{
-		Version:      ManifestVersion,
-		Capabilities: []CapabilityConfig{{Name: "unknown"}},
+		Version: ManifestVersion,
+		Tools:   []Tool{{Name: "x", Type: "unknown"}},
 	}, &testDispatchers{}); err == nil {
-		t.Fatal("expected unsupported capability error")
+		t.Fatal("expected unsupported type error")
+	}
+}
+
+// A core.agent tool requires a brain (settings.code) and recurses into its tools.
+func TestValidateManifestValidatesNestedAgent(t *testing.T) {
+	_, err := ValidateManifest(Manifest{
+		Version: ManifestVersion,
+		Brain:   "root",
+		Tools: []Tool{{
+			Name:     "scout",
+			Type:     AgentToolType,
+			Settings: json.RawMessage(`{}`),
+		}},
+	}, &testDispatchers{})
+	if err == nil {
+		t.Fatal("expected error: agent tool without settings.code")
 	}
 }

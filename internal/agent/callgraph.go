@@ -171,14 +171,13 @@ func (r *Runtime) callGraphLocked(runID string, visited map[string]bool) RunGrap
 		Answer:   run.answer,
 		Error:    run.err,
 	}
-	// Build a brain→name index from the parent manifest for backward-compat
-	// backfill: runs created before Name was tracked in the manifest have an
-	// empty Name on their own manifest but we can infer it from the parent's
-	// ChildManifest list by matching the child's brain.
-	childNameByBrain := make(map[string]string, len(run.manifest.Children))
-	for _, cm := range run.manifest.Children {
-		if cm.Brain != "" && cm.Name != "" {
-			childNameByBrain[cm.Brain] = cm.Name
+	// Build a brain→name index from the parent's agent tools as a backfill: a
+	// child run with an empty Name can infer it from the parent's `core.agent`
+	// tool whose brain (settings.code) matches.
+	childNameByBrain := make(map[string]string)
+	for _, tool := range run.manifest.agentTools() {
+		if s, err := decodeAgentSettings(tool); err == nil && s.Code != "" && tool.Name != "" {
+			childNameByBrain[s.Code] = tool.Name
 		}
 	}
 	for _, childID := range run.childRunIDs {

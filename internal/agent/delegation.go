@@ -10,13 +10,18 @@ import (
 	"github.com/aurora-capcompute/capcompute/dispatcher"
 )
 
-type delegationRouter struct {
+// agentRouter is the dispatcher for `core.agent` tools. It runs each sub-agent
+// as a tracked child run of the runtime; its Dispatch forwards a call to that
+// run and returns the child's answer (or propagates a yield for HITL). It sits
+// in the runtime dispatcher stack where the leaf tools cannot reach the runtime.
+type agentRouter struct {
 	next     dispatcher.Dispatcher[RunContext]
-	children map[string]delegationChild
+	children map[string]agentChild
 }
 
-type delegationChild struct {
-	manifest ChildManifest
+type agentChild struct {
+	tool     Tool
+	settings AgentSettings
 	runtime  *Runtime
 }
 
@@ -29,32 +34,29 @@ type delegateResult struct {
 	Answer string `json:"answer"`
 }
 
-func newDelegationRouter(next dispatcher.Dispatcher[RunContext], children []ChildManifest, runtime *Runtime) *delegationRouter {
-	m := make(map[string]delegationChild, len(children))
-	for _, child := range children {
-		m[child.Name] = delegationChild{
-			manifest: child,
-			runtime:  runtime,
+func newAgentRouter(next dispatcher.Dispatcher[RunContext], agents []Tool, runtime *Runtime) (*agentRouter, error) {
+	m := make(map[string]agentChild, len(agents))
+	for _, tool := range agents {
+		settings, err := decodeAgentSettings(tool)
+		if err != nil {
+			return nil, fmt.Errorf("agent tool %q settings: %w", tool.Name, err)
 		}
+		m[tool.Name] = agentChild{tool: tool, settings: settings, runtime: runtime}
 	}
-	return &delegationRouter{next: next, children: m}
+	return &agentRouter{next: next, children: m}, nil
 }
 
-func (r *delegationRouter) Dispatch(ctx context.Context, key RunContext, call dispatcher.Call, auth dispatcher.Authorization) (dispatcher.Outcome, error) {
-	if strings.HasPrefix(call.Name, "call.") {
-		childName := call.Name[len("call."):]
-		child, ok := r.children[childName]
-		if ok {
-			return child.dispatch(ctx, key, call)
-		}
+func (r *agentRouter) Dispatch(ctx context.Context, key RunContext, call dispatcher.Call, auth dispatcher.Authorization) (dispatcher.Outcome, error) {
+	if child, ok := r.children[call.Name]; ok {
+		return child.dispatch(ctx, key, call)
 	}
 	return r.next.Dispatch(ctx, key, call, auth)
 }
 
-func (r *delegationRouter) Capabilities() []dispatcher.Capability {
+func (r *agentRouter) Capabilities() []dispatcher.Capability {
 	caps := r.next.Capabilities()
 	for name, child := range r.children {
-		caps = append(caps, delegationCapability(name, child.manifest))
+		caps = append(caps, agentCapability(name, child))
 	}
 	return caps
 }
@@ -63,14 +65,14 @@ func (r *delegationRouter) Capabilities() []dispatcher.Capability {
 // forces the parent run to fail (a dispatcher error alone only surfaces a
 // recoverable observation to the brain); otherwise the failure is reported to
 // the parent brain as a recoverable failed observation.
-func (c *delegationChild) onChildFailure(parentRunID string, err error) (dispatcher.Outcome, error) {
-	if c.manifest.OnFailure == OnFailurePropagate {
-		c.runtime.requestRunFailure(parentRunID, fmt.Errorf("child %q failed: %w", c.manifest.Name, err))
+func (c *agentChild) onChildFailure(parentRunID string, err error) (dispatcher.Outcome, error) {
+	if c.settings.OnFailure == OnFailurePropagate {
+		c.runtime.requestRunFailure(parentRunID, fmt.Errorf("child %q failed: %w", c.tool.Name, err))
 	}
 	return dispatcher.Fail(err.Error()), nil
 }
 
-func (c *delegationChild) dispatch(ctx context.Context, parent RunContext, call dispatcher.Call) (dispatcher.Outcome, error) {
+func (c *agentChild) dispatch(ctx context.Context, parent RunContext, call dispatcher.Call) (dispatcher.Outcome, error) {
 	var args delegateArgs
 	if err := json.Unmarshal(call.Args, &args); err != nil {
 		return dispatcher.Fail(fmt.Sprintf("decode delegation args: %v", err)), nil
@@ -104,13 +106,13 @@ func (c *delegationChild) dispatch(ctx context.Context, parent RunContext, call 
 			return c.onChildFailure(parent.RunID, err)
 		}
 		if parked {
-			return dispatcher.Yield(fmt.Sprintf("waiting on child %s", c.manifest.Name)), nil
+			return dispatcher.Yield(fmt.Sprintf("waiting on child %s", c.tool.Name)), nil
 		}
 		return delegationResult(answer)
 	}
 
-	childManifest := buildChildManifest(c.manifest, args.SystemPrompt)
-	slog.Info("spawning child run in parent thread", "parent_run", parent.RunID, "child", c.manifest.Name)
+	childManifest := buildChildManifest(c.tool, c.settings, args.SystemPrompt)
+	slog.Info("spawning child run in parent thread", "parent_run", parent.RunID, "child", c.tool.Name)
 	run, err := c.runtime.createChildRun(parent.RunID, parent.ThreadID, args.Message, childManifest)
 	if err != nil {
 		return dispatcher.Fail(fmt.Sprintf("create child run: %v", err)), nil
@@ -123,7 +125,7 @@ func (c *delegationChild) dispatch(ctx context.Context, parent RunContext, call 
 		// The child parked for human approval. Yield so the parent run suspends
 		// durably; the child→parent finish hook re-drives this call once the child
 		// finishes, and the reconnect branch above returns its answer.
-		return dispatcher.Yield(fmt.Sprintf("waiting on child %s", c.manifest.Name)), nil
+		return dispatcher.Yield(fmt.Sprintf("waiting on child %s", c.tool.Name)), nil
 	}
 	return delegationResult(answer)
 }
@@ -137,61 +139,48 @@ func delegationResult(answer string) (dispatcher.Outcome, error) {
 	return dispatcher.Result(result), nil
 }
 
-func buildChildManifest(child ChildManifest, systemPromptOverride string) Manifest {
-	prompt := child.SystemPrompt
+// buildChildManifest lifts a `core.agent` tool node into a Manifest for the child
+// run: brain/system_prompt come from the tool's AgentSettings, composition from
+// its nested Tools.
+func buildChildManifest(tool Tool, settings AgentSettings, systemPromptOverride string) Manifest {
+	prompt := settings.SystemPrompt
 	if systemPromptOverride != "" {
 		prompt = systemPromptOverride
 	}
-	caps := make([]CapabilityConfig, len(child.Capabilities))
-	for i, cap := range child.Capabilities {
-		caps[i] = CapabilityConfig{
-			Name:     cap.Name,
-			Settings: append(json.RawMessage(nil), cap.Settings...),
-		}
-	}
-	var children []ChildManifest
-	if len(child.Children) > 0 {
-		children = make([]ChildManifest, len(child.Children))
-		copy(children, child.Children)
-	}
 	return Manifest{
 		Version:      ManifestVersion,
-		Name:         child.Name,
-		Brain:        child.Brain,
-		BindingRef:   child.BindingRef,
+		Name:         tool.Name,
+		Brain:        settings.Code,
+		BindingRef:   settings.BindingRef,
 		SystemPrompt: prompt,
-		Capabilities: caps,
-		Children:     children,
+		OnFailure:    settings.OnFailure,
+		Tools:        cloneTools(tool.Tools),
 	}
 }
 
-func delegationCapability(name string, child ChildManifest) dispatcher.Capability {
+func agentCapability(name string, child agentChild) dispatcher.Capability {
 	var desc strings.Builder
 	desc.WriteString("Delegate work to the ")
 	desc.WriteString(name)
-	desc.WriteString(" brain.")
-	visibleCaps := make([]string, 0, len(child.Capabilities))
-	for _, cap := range child.Capabilities {
-		if !cap.Hidden {
-			visibleCaps = append(visibleCaps, cap.Name)
+	desc.WriteString(" agent.")
+	visible := make([]string, 0, len(child.tool.Tools))
+	for _, t := range child.tool.Tools {
+		if !t.Hidden {
+			visible = append(visible, t.Name)
 		}
 	}
-	if len(visibleCaps) > 0 {
+	if len(visible) > 0 {
 		desc.WriteString(" It can: ")
-		for i, name := range visibleCaps {
-			if i > 0 {
-				desc.WriteString(", ")
-			}
-			desc.WriteString(name)
-		}
+		desc.WriteString(strings.Join(visible, ", "))
 		desc.WriteString(".")
 	} else {
-		desc.WriteString(" Pure computation brain, no external capabilities.")
+		desc.WriteString(" Pure computation agent, no external tools.")
 	}
 	return dispatcher.Capability{
-		Name:        "call." + name,
+		Name:        name,
 		Description: desc.String(),
-		InputSchema: json.RawMessage(`{"type":"object","properties":{"message":{"type":"string","description":"Task description for the child brain"},"system_prompt":{"type":"string","description":"Optional system prompt override"}},"required":["message"],"additionalProperties":false}`),
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"message":{"type":"string","description":"Task description for the child agent"},"system_prompt":{"type":"string","description":"Optional system prompt override"}},"required":["message"],"additionalProperties":false}`),
+		Hidden:      child.tool.Hidden,
 	}
 }
 

@@ -60,7 +60,7 @@ func (l *lifecycleDispatcher) Dispatch(ctx context.Context, key RunKey, call dis
 			Message:      l.message,
 			History:      l.history,
 			SystemPrompt: l.systemPrompt,
-			Capabilities: visibleCapabilities(l.next.Capabilities(), l.manifest),
+			Capabilities: visibleCapabilities(l.next.Capabilities()),
 		})
 		if err != nil {
 			return dispatcher.Fail(err.Error()), nil

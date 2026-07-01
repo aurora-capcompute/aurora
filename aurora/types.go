@@ -10,8 +10,8 @@ import (
 // DTOs
 
 type Manifest = agent.Manifest
-type ChildManifest = agent.ChildManifest
-type CapabilityConfig = agent.CapabilityConfig
+type Tool = agent.Tool
+type AgentSettings = agent.AgentSettings
 type ThreadSummary = agent.ThreadSummary
 type ThreadSnapshot = agent.ThreadSnapshot
 type HistoryMessage = agent.HistoryMessage
@@ -101,8 +101,10 @@ var (
 // Constants
 
 const (
-	DefaultTenantID       = agent.DefaultTenantID
-	DefaultBrainID        = agent.DefaultBrainID
-	ManifestVersion       = agent.ManifestVersion
-	LegacyManifestVersion = agent.LegacyManifestVersion
+	DefaultTenantID    = agent.DefaultTenantID
+	DefaultBrainID     = agent.DefaultBrainID
+	ManifestVersion    = agent.ManifestVersion
+	AgentToolType      = agent.AgentToolType
+	OnFailureReport    = agent.OnFailureReport
+	OnFailurePropagate = agent.OnFailurePropagate
 )

@@ -121,8 +121,12 @@ func NewRuntime(ctx context.Context, config Config) (*Runtime, error) {
 			}
 			var d dispatcher.Dispatcher[RunKey] = base
 			d = newProgressDispatcher(d, runtime.publish, key.ThreadID, key.RunID)
-			if len(manifest.Children) > 0 {
-				d = newDelegationRouter(d, manifest.Children, runtime)
+			if agents := manifest.agentTools(); len(agents) > 0 {
+				router, err := newAgentRouter(d, agents, runtime)
+				if err != nil {
+					return nil, err
+				}
+				d = router
 			}
 			// Wrap with the lifecycle dispatcher so agent.input/agent.finish are
 			// recorded on the replay journal alongside capability calls.

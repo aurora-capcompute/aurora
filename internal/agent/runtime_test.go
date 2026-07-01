@@ -207,8 +207,8 @@ func TestRuntimePassesManifestToDispatcherProvider(t *testing.T) {
 	}
 	run, err := runtime.CreateRun(thread.ID, "finish", Manifest{
 		Version: ManifestVersion,
-		Capabilities: []CapabilityConfig{{
-			Name: "custom.call", Settings: json.RawMessage(`{"value":2}`),
+		Tools: []Tool{{
+			Name: "custom.call", Type: "core.custom", Settings: json.RawMessage(`{"value":2}`),
 		}},
 	})
 	if err != nil {
@@ -229,7 +229,7 @@ func TestRuntimePassesManifestToDispatcherProvider(t *testing.T) {
 	dispatchers.mu.Lock()
 	defer dispatchers.mu.Unlock()
 	if len(dispatchers.manifests) != 1 ||
-		string(dispatchers.manifests[0].Capabilities[0].Settings) != `{"value":2}` {
+		string(dispatchers.manifests[0].Tools[0].Settings) != `{"value":2}` {
 		t.Fatalf("dispatcher manifests = %+v", dispatchers.manifests)
 	}
 }
@@ -290,7 +290,7 @@ func TestRuntimeSetBrainsLifecycle(t *testing.T) {
 	}
 	run, err := runtime.CreateRun(thread.ID, "finish", Manifest{
 		Version:      ManifestVersion,
-		Capabilities: []CapabilityConfig{{Name: "custom.call", Settings: json.RawMessage(`{"value":1}`)}},
+		Tools: []Tool{{Name: "custom.call", Type: "core.custom", Settings: json.RawMessage(`{"value":1}`)}},
 	})
 	if err != nil {
 		t.Fatalf("create run: %v", err)
@@ -435,23 +435,41 @@ func (cascadeDispatcher) Dispatch(_ context.Context, _ RunContext, call dispatch
 		} `json:"messages"`
 	}
 	_ = json.Unmarshal(call.Args, &req)
-	isChild, hasTool := false, false
-	for _, m := range req.Messages {
-		if m.Role == "user" && strings.Contains(m.Content, "do subtask") {
-			isChild = true
-		}
-		if m.Role == "tool" {
-			hasTool = true
-		}
-	}
+	firstUser, laterUser := firstAndLaterUser(req.Messages)
 	switch {
-	case isChild:
+	case strings.Contains(firstUser, "do subtask"):
+		// This is the child brain (its run input is the delegation message).
 		return chatActions(`{"actions":[{"action":"final","content":{"answer":"child-done"}}]}`), nil
-	case hasTool:
+	case laterUser:
+		// The parent already delegated and is now observing the child's result.
 		return chatActions(`{"actions":[{"action":"final","content":{"answer":"parent-done"}}]}`), nil
 	default:
-		return chatActions(`{"actions":[{"action":"call.child","content":{"message":"do subtask"}}]}`), nil
+		return chatActions(`{"actions":[{"action":"child","content":{"message":"do subtask"}}]}`), nil
 	}
+}
+
+// firstAndLaterUser returns the first user message (the run's input) and whether
+// any subsequent user message exists (a tool observation the guest appends as a
+// user-role message). Mock brains distinguish child from parent by their input
+// rather than by scanning every user message, whose content includes the echoed
+// delegation args.
+func firstAndLaterUser(messages []struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}) (first string, later bool) {
+	seen := false
+	for _, m := range messages {
+		if m.Role != "user" {
+			continue
+		}
+		if !seen {
+			first = m.Content
+			seen = true
+		} else {
+			later = true
+		}
+	}
+	return first, later
 }
 
 func onlyChildRun(t *testing.T, r *Runtime, parentID string) string {
@@ -518,7 +536,7 @@ func TestRuntimeCascadeResumeReusesChildRun(t *testing.T) {
 	run, err := runtime.CreateRun(thread.ID, "parent task", Manifest{
 		Version:  ManifestVersion,
 		Brain:    "brain@1",
-		Children: []ChildManifest{{Name: "child", Brain: "brain@1", Capabilities: []CapabilityConfig{}}},
+		Tools: []Tool{{Name: "child", Type: AgentToolType, Settings: json.RawMessage(`{"code":"brain@1"}`)}},
 	})
 	if err != nil {
 		t.Fatalf("create run: %v", err)
@@ -604,7 +622,7 @@ func (failingChildDispatcher) Dispatch(_ context.Context, _ RunContext, call dis
 			return chatActions(`{"actions":[{"action":"missing.tool","content":{}}]}`), nil
 		}
 	}
-	return chatActions(`{"actions":[{"action":"call.child","content":{"message":"do subtask"}}]}`), nil
+	return chatActions(`{"actions":[{"action":"child","content":{"message":"do subtask"}}]}`), nil
 }
 
 func TestRuntimeChildFailurePropagatesToParent(t *testing.T) {
@@ -642,9 +660,9 @@ func TestRuntimeChildFailurePropagatesToParent(t *testing.T) {
 	run, err := runtime.CreateRun(thread.ID, "parent task", Manifest{
 		Version: ManifestVersion,
 		Brain:   "brain@1",
-		Children: []ChildManifest{{
-			Name: "child", Brain: "brain@1", Capabilities: []CapabilityConfig{},
-			OnFailure: OnFailurePropagate,
+		Tools: []Tool{{
+			Name: "child", Type: AgentToolType,
+			Settings: json.RawMessage(`{"code":"brain@1","on_failure":"propagate"}`),
 		}},
 	})
 	if err != nil {
@@ -703,13 +721,10 @@ func (d *failThenSucceedDispatcher) Dispatch(_ context.Context, _ RunContext, ca
 			} `json:"messages"`
 		}
 		_ = json.Unmarshal(call.Args, &req)
-		hasTool := false
-		for _, m := range req.Messages {
-			if m.Role == "tool" {
-				hasTool = true
-			}
-		}
-		if !hasTool {
+		// A tool observation is appended as a user-role message, so the second
+		// turn is signalled by a user message beyond the run's initial input.
+		_, laterUser := firstAndLaterUser(req.Messages)
+		if !laterUser {
 			return chatActions(`{"actions":[{"action":"tool.x","content":{}}]}`), nil
 		}
 		d.parent.mu.Lock()
@@ -795,17 +810,10 @@ func (d *cascadeResumeDispatcherImpl) Dispatch(_ context.Context, _ RunContext, 
 			} `json:"messages"`
 		}
 		_ = json.Unmarshal(call.Args, &req)
-		isChild, hasTool := false, false
-		for _, m := range req.Messages {
-			if m.Role == "user" && strings.Contains(m.Content, "do subtask") {
-				isChild = true
-			}
-			if m.Role == "tool" {
-				hasTool = true
-			}
-		}
+		firstUser, laterUser := firstAndLaterUser(req.Messages)
+		isChild := strings.Contains(firstUser, "do subtask")
 		if isChild {
-			if !hasTool {
+			if !laterUser {
 				// Child first turn: call tool.x
 				return chatActions(`{"actions":[{"action":"tool.x","content":{}}]}`), nil
 			}
@@ -820,10 +828,10 @@ func (d *cascadeResumeDispatcherImpl) Dispatch(_ context.Context, _ RunContext, 
 			return chatActions(`{"actions":[{"action":"final","content":{"answer":"child-done"}}]}`), nil
 		}
 		// Parent: delegate on first turn, finish once it has the child's result.
-		if hasTool {
+		if laterUser {
 			return chatActions(`{"actions":[{"action":"final","content":{"answer":"parent-done"}}]}`), nil
 		}
-		return chatActions(`{"actions":[{"action":"call.child","content":{"message":"do subtask"}}]}`), nil
+		return chatActions(`{"actions":[{"action":"child","content":{"message":"do subtask"}}]}`), nil
 	default:
 		return dispatcher.Fail("unsupported call: " + call.Name), nil
 	}
@@ -864,11 +872,11 @@ func TestRuntimeCascadeResumeUsesResumeModeForFailedChild(t *testing.T) {
 	run, err := runtime.CreateRun(thread.ID, "parent task", Manifest{
 		Version: ManifestVersion,
 		Brain:   "brain@1",
-		Children: []ChildManifest{{
-			Name:         "child",
-			Brain:        "brain@1",
-			OnFailure:    OnFailurePropagate,
-			Capabilities: []CapabilityConfig{{Name: "tool.x"}},
+		Tools: []Tool{{
+			Name:     "child",
+			Type:     AgentToolType,
+			Settings: json.RawMessage(`{"code":"brain@1","on_failure":"propagate"}`),
+			Tools:    []Tool{{Name: "tool.x", Type: "core.custom"}},
 		}},
 	})
 	if err != nil {
@@ -935,7 +943,7 @@ func TestRuntimeHardRetryForksFromBeginning(t *testing.T) {
 	run, err := runtime.CreateRun(thread.ID, "task", Manifest{
 		Version:      ManifestVersion,
 		Brain:        "brain@1",
-		Capabilities: []CapabilityConfig{{Name: "tool.x"}},
+		Tools: []Tool{{Name: "tool.x", Type: "core.custom"}},
 	})
 	if err != nil {
 		t.Fatalf("create run: %v", err)

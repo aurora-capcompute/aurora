@@ -113,16 +113,14 @@ func copyTime(value *time.Time) *time.Time {
 	return &copy
 }
 
-func visibleCapabilities(caps []dispatcher.Capability, manifest Manifest) []dispatcher.Capability {
-	hidden := make(map[string]bool, len(manifest.Capabilities))
-	for _, c := range manifest.Capabilities {
-		if c.Hidden {
-			hidden[c.Name] = true
-		}
-	}
+// visibleCapabilities drops capabilities marked Hidden (e.g. the LLM cognition
+// tool) from the brain's discoverable menu. Hidden is set at build time on each
+// published capability, so it works even when a tool's published operation names
+// differ from its local name.
+func visibleCapabilities(caps []dispatcher.Capability) []dispatcher.Capability {
 	visible := make([]dispatcher.Capability, 0, len(caps))
 	for _, c := range caps {
-		if !hidden[c.Name] {
+		if !c.Hidden {
 			visible = append(visible, c)
 		}
 	}
